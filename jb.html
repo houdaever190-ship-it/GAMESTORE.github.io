@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ar" manifest="cache.appcache">
+<html lang="en" manifest="cache.appcache">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -16,15 +16,12 @@
           15px/1.45 "Segoe UI",
           system-ui,
           sans-serif;
-        text-align: right;
-        direction: rtl;
       }
       #brand {
         text-align: center;
         padding: 8px 10px;
         background: #0e1116;
         border-bottom: 1px solid #1e2732;
-        direction: ltr;
       }
       #brand img {
         width: 28px;
@@ -41,6 +38,7 @@
         vertical-align: middle;
       }
 
+      /* running: a spinner under the brand. jb.js sets body.done / body.fail / body.log. */
       #spin {
         position: fixed;
         top: calc(50% + 20px);
@@ -87,6 +85,7 @@
         display: block;
       }
 
+      /* ?log=1 -- the full step log, styled like the landing. */
       body.log #spin,
       body.log #msg {
         display: none;
@@ -135,13 +134,21 @@
   </head>
   <body>
     <div id="brand">
-      <img src="logo_raw.png" alt="" width="28" height="28" />
-      <b>GAME STORE</b>
+      <img
+        src="logo_UD.png"
+        alt=""
+        width="28"
+        height="28"
+      /><b>GAME STORE</b>
     </div>
-    <div id="msg">جاري تشغيل التعديل، يرجى الانتظار...</div>
+    <div id="spin"></div>
+    <div id="msg">Restart your console</div>
     <div id="wrap">
-      <div id="state">جاري التنفيذ...</div>
+      <div id="state"></div>
       <div id="out"></div>
     </div>
+    <script type="module">
+      import "./jb.js?v=10";
+    </script>
   </body>
 </html>
