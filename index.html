@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="ar" manifest="cache.appcache">
+<html lang="en" manifest="cache.appcache">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GAME STORE</title>
 <style>
   html, body { margin:0; padding:0; background:#0b0d10; color:#c8ced8;
-               font:15px/1.45 "Segoe UI", system-ui, sans-serif; text-align: right; direction: rtl; }
+               font:15px/1.45 "Segoe UI", system-ui, sans-serif; }
   #wrap { padding:16px 18px; }
   #state { font-size:22px; font-weight:700; margin:0 0 6px; }
   #det { font-size:13px; color:#8b95a3; margin:0 0 4px; }
@@ -15,7 +15,7 @@
   #cache.cacheok { color:#7fd0a0; }
   .ok { color:#7fd0a0; } .bad { color:#d08a7f; } .warn { color:#d8c07f; }
   #brand { text-align:center; padding:8px 10px; background:#0e1116;
-           border-bottom:1px solid #1e2732; direction: ltr; }
+           border-bottom:1px solid #1e2732; }
   #brand img { width:28px; height:28px; margin-right:8px; border-radius:50%;
                vertical-align:middle; }
   #brand b { font-size:15px; font-weight:700; letter-spacing:.14em;
@@ -23,9 +23,9 @@
 </style>
 </head>
 <body>
-<div id="brand"><img src="logo_UD.png" alt="" width="28" height="28"><b>GAME STORE</b></div>
+<div id="brand"><img src="logo_raw.png" alt="" width="28" height="28"><b>RAW GAME</b></div>
 <div id="wrap">
-  <div id="state">جاري فحص نظام الجهاز...</div>
+  <div id="state">detecting firmware...</div>
   <div id="det"></div>
   <div id="cache"></div>
 </div>
@@ -39,7 +39,12 @@
     function setCache(t, ok) { cacheEl.textContent = t; cacheEl.className = ok ? "cacheok" : ""; }
     var params = new URLSearchParams(location.search);
 
-    var SUPPORTED = { 1302: 1, 1304: 1, 1350: 1, 1352: 1 }; 
+    // Firmwares this build has a MEASURED kernel table for. jb.js still runs its
+    // own kernel-table-present gate, so this is UX only -- an unlisted firmware
+    // can still be launched with a tap. KEEP IN SYNC with ps4_offsets.js: add a
+    // fwnum here in the SAME commit that fills that firmware's kernel RVAs.
+    // The PS4 reports its minor as two hex digits in the UA (13.52 -> minor 0x52).
+    var SUPPORTED = { 1302: 1, 1304: 1, 1350: 1, 1352: 1 }; // all measured on hardware
 
     var key = null, fwnum = null;
     var m = /PlayStation\s+4[\/ ](\d+)\.(\d+)/.exec(navigator.userAgent);
@@ -52,12 +57,12 @@
 
     var forced = params.get("force") === "1";
     var supported = forced || (fwnum !== null && SUPPORTED[fwnum] === 1);
-    detEl.innerHTML = "إصدار النظام الحالي: <b>" + (key || "غير معروف") + "</b>"
-        + (supported ? " &middot; <b class='ok'>مدعوم</b>"
-                     : " &middot; <span class='bad'>غير مدعوم في هذا الإصدار</span>");
+    detEl.innerHTML = "firmware <b>" + (key || "unknown") + "</b>"
+        + (supported ? " &middot; <b>supported</b>"
+                     : " &middot; not in this build's kernel table");
 
     var target = "jb.html" + location.search;
-    function go() { setState("جاري تحميل التعديل...", "warn"); location.replace(target); }
+    function go() { setState("loading jailbreak...", "warn"); location.replace(target); }
 
     function waitForTap(msg, action) {
         setState(msg, "warn");
@@ -70,9 +75,11 @@
         window.addEventListener("keydown", fire);
     }
 
+    // Off-target consoles are not launched automatically -- one tap still runs
+    // it, so a user-agent quirk on the real 13.52 console can never lock it out.
     if (!supported) {
-        setState("نظام الجهاز غير مدعوم تلقائياً", "bad");
-        waitForTap("نظام غير مدعوم (" + (key || "غير معروف") + ") -- اضغط X أو المس الشاشة للتشغيل على أي حال", go);
+        setState("UNSUPPORTED FIRMWARE", "bad");
+        waitForTap("UNSUPPORTED (" + (key || "unknown") + ") -- press X or tap to run anyway", go);
         return;
     }
 
@@ -80,45 +87,45 @@
     if (!ac || !document.documentElement.hasAttribute("manifest")) {
         go();
     } else if (!navigator.onLine) {
-        setCache("وضع الأوفلاين -- يتم التشغيل من الذاكرة المؤقتة", true);
+        setCache("offline -- from cache", true);
         go();
     } else if (ac.status === ac.IDLE) {
-        setCache("تم الحفظ في الذاكرة المؤقتة مسبقاً", true);
+        setCache("cached", true);
         go();
     } else if (ac.status === ac.UPDATEREADY) {
         try { ac.swapCache(); } catch (e) {}
-        setCache("تم تحميل التحديث بنجاح", true);
-        waitForTap("التحديث جاهز -- اضغط X أو المس الشاشة لإعادة التحميل والتشغيل",
+        setCache("update downloaded", true);
+        waitForTap("UPDATE READY -- press X or tap to reload & run",
                    function () { location.reload(); });
     } else {
-        setCache("جاري فحص الذاكرة المؤقتة...");
+        setCache("checking cache...");
         ac.addEventListener("downloading",
-            function () { setCache("جاري حفظ الملفات لتشغيلها بدون إنترنت (للمرة الأولى)..."); }, false);
+            function () { setCache("caching for offline (first run)..."); }, false);
         ac.addEventListener("progress", function (e) {
             if (e && e.total)
-                setCache("جاري الحفظ: " + Math.round((e.loaded / e.total) * 100) + "%");
+                setCache("caching " + Math.round((e.loaded / e.total) * 100) + "%");
         }, false);
         ac.addEventListener("cached", function () {
-            setCache("تم الحفظ بنجاح للاستخدام بدون إنترنت", true);
-            waitForTap("اكتمل الحفظ -- اضغط X أو المس الشاشة للتشغيل الآن", go);
+            setCache("cached for offline use", true);
+            waitForTap("CACHED (first run) -- press X or tap to run", go);
         }, false);
         ac.addEventListener("updateready", function () {
             try { ac.swapCache(); } catch (e) {}
-            setCache("تم تحميل التحديث بنجاح", true);
-            waitForTap("التحديث جاهز -- اضغط X أو المس الشاشة لإعادة التحميل والتشغيل",
+            setCache("update downloaded", true);
+            waitForTap("UPDATE READY -- press X or tap to reload & run",
                        function () { location.reload(); });
         }, false);
         ac.addEventListener("noupdate", function () {
-            setCache("الملفات محدثة وجاهزة للاستخدام بدون إنترنت", true);
+            setCache("cached -- offline ready", true);
             go();
         }, false);
         ac.addEventListener("error", function () {
-            setCache("فشل الحفظ في الذاكرة المؤقتة");
-            waitForTap("فشل التخزين -- اضغط X أو المس الشاشة للتشغيل على أي حال", go);
+            setCache("cache unavailable");
+            waitForTap("CACHE FAILED -- press X or tap to run anyway", go);
         }, false);
         ac.addEventListener("obsolete", function () {
-            setCache("الملفات المخزنة قديمة");
-            waitForTap("ملفات قديمة -- اضغط X أو المس الشاشة للتشغيل", go);
+            setCache("cache obsolete");
+            waitForTap("CACHE OBSOLETE -- press X or tap to run", go);
         }, false);
     }
 })();
