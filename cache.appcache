@@ -1,5 +1,5 @@
 CACHE MANIFEST
-# rev 20260921-houda-store-v6
+# rev 20260921-houda-store-v0
 
 index.html
 jb.html
@@ -10,8 +10,8 @@ mem.js
 int64.js
 ps4_offsets.js
 rpc_worker.js
-goldhen_2.4b18.10.bin
-hen.bin
+payload2.bin
+goldhen.bin
 patches/1302.bin
 patches/1350.bin
 patches/1352.bin
